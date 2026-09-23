@@ -1639,7 +1639,8 @@ wire_api = "responses"
             "startup completion must clear a renderer report captured during recovery"
         );
     }
-}    #[test]
+
+    #[test]
     fn merge_projection_preserves_existing_context_overrides_for_router() {
         let current = r#"model = "gpt-5.6-sol"
 model_provider = "codex_model_router_v2"
@@ -1703,5 +1704,4 @@ base_url = "http://127.0.0.1:15721/v1"
             "user context overrides must not be reported as CCSM-owned drift"
         );
     }
-
-
+}
