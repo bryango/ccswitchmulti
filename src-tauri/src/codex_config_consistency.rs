@@ -159,15 +159,10 @@ fn ccsm_owned_projection(
     let provider_id = provider_id_hint
         .map(str::to_string)
         .or_else(|| active_model_provider_id(&value));
-    if provider_id.as_deref() == Some(crate::codex_config::CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID)
-    {
-        for key in ["model_context_window", "model_auto_compact_token_limit"] {
-            if let Some(value) = root.get(key) {
-                managed.insert(key.to_string(), value.clone());
-            }
-        }
-    }
 
+    // Context-window overrides are user-authored preferences, including while
+    // MultiRouter is active. Keep them outside the CCSM-owned fingerprint so a
+    // consistency repair never treats their presence as drift.
     if let Some(provider_id) = provider_id {
         if let Some(provider) = root
             .get("model_providers")
@@ -329,14 +324,9 @@ fn merge_ccsm_owned_projection(current: &str, expected: &str) -> Result<String, 
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    if expected_provider_id.as_deref()
-        == Some(crate::codex_config::CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID)
-    {
-        for key in ["model_context_window", "model_auto_compact_token_limit"] {
-            copy_or_remove_top_level_item(&mut target, &expected, key);
-        }
-    }
-
+    // Preserve existing model_context_window / model_auto_compact_token_limit
+    // values. They are not owned by consistency reconciliation; issue #94 will
+    // add a durable per-model source of truth separately.
     if let Some(provider_id) = expected_provider_id {
         let expected_provider = expected
             .get("model_providers")
@@ -1647,6 +1637,71 @@ wire_api = "responses"
         assert!(
             should_emit_report(&healthy_completion),
             "startup completion must clear a renderer report captured during recovery"
+        );
+    }
+
+    #[test]
+    fn merge_projection_preserves_existing_context_overrides_for_router() {
+        let current = r#"model = "gpt-5.6-sol"
+model_provider = "codex_model_router_v2"
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
+
+[model_providers.codex_model_router_v2]
+name = "Old Router"
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+        let expected = r#"model = "gpt-5.6-sol"
+model_provider = "codex_model_router_v2"
+model_catalog_json = "cc-switch-model-catalog.json"
+
+[model_providers.codex_model_router_v2]
+name = "OpenAI Multi-Model Router"
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+
+        let merged =
+            merge_ccsm_owned_projection(current, expected).expect("merge managed projection");
+        let parsed: toml::Value = toml::from_str(&merged).expect("parse merged config");
+
+        assert_eq!(
+            parsed
+                .get("model_context_window")
+                .and_then(toml::Value::as_integer),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            parsed
+                .get("model_auto_compact_token_limit")
+                .and_then(toml::Value::as_integer),
+            Some(900_000)
+        );
+    }
+
+    #[test]
+    fn router_fingerprint_ignores_user_context_overrides() {
+        let expected = r#"model = "gpt-5.6-sol"
+model_provider = "codex_model_router_v2"
+
+[model_providers.codex_model_router_v2]
+name = "OpenAI Multi-Model Router"
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+        let actual = r#"model = "gpt-5.6-sol"
+model_provider = "codex_model_router_v2"
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
+
+[model_providers.codex_model_router_v2]
+name = "OpenAI Multi-Model Router"
+base_url = "http://127.0.0.1:15721/v1"
+"#;
+
+        let provider_id = Some(crate::codex_config::CC_SWITCH_CODEX_ROUTER_MODEL_PROVIDER_ID);
+        assert_eq!(
+            managed_fingerprint(expected, provider_id).expect("expected fingerprint"),
+            managed_fingerprint(actual, provider_id).expect("actual fingerprint"),
+            "user context overrides must not be reported as CCSM-owned drift"
         );
     }
 }

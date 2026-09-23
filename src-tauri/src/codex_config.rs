@@ -2964,9 +2964,6 @@ fn set_codex_model_catalog_projection_fields(
 }
 
 /// 判断当前配置是否启用了至少一条 MultiRouter 路由。
-///
-/// 多路路由把不同模型放在同一个 Codex provider 下。此时顶层窗口或压缩阈值会被
-/// Codex 无条件套用到每个模型，必须让每个 catalog 模型自己的元数据生效。
 fn codex_multi_router_is_enabled(settings: &Value) -> bool {
     let Some(routing) = settings.get("codexRouting") else {
         return false;
@@ -3122,15 +3119,6 @@ fn apply_codex_multi_agent_transport_policy(catalog: &mut Value, settings: &Valu
             }
         }
     }
-}
-
-/// 移除会覆盖逐模型目录元数据的 MultiRouter 顶层字段。
-///
-/// 这只用于 CCSwitchMulti 托管的多模型路由。普通单模型 provider 仍可使用用户手写的
-/// 顶层覆盖；不能把窗口改成最大值，否则长窗口切短窗口时会失去官方的预压缩保护。
-fn remove_multi_router_context_overrides(doc: &mut DocumentMut) {
-    doc.as_table_mut().remove("model_context_window");
-    doc.as_table_mut().remove("model_auto_compact_token_limit");
 }
 
 /// 判断已解析的 Codex TOML 是否实际指向 CCSwitchMulti 的多模型路由 provider。
@@ -6364,7 +6352,8 @@ fn prepare_codex_config_text_with_model_catalog_impl(
         );
         let config_text =
             if codex_multi_router_is_enabled(settings) || codex_document_uses_multi_router(&doc) {
-                remove_multi_router_context_overrides(&mut doc);
+                // Keep user-authored top-level context overrides if they already exist.
+                // Full per-model persistence is tracked separately in issue #94.
                 doc.to_string()
             } else {
                 config_text
@@ -7146,11 +7135,9 @@ fn remove_codex_provider_owned_fields_missing_from_provider(
 
     remove_stale_cc_switch_model_provider_sections(live_doc, provider_doc);
 
-    // `codex_model_router_v2` 的模型会在同一 session 内切换。顶层覆盖会掩盖
-    // catalog 的逐模型窗口，进而阻止 Codex 在长窗口切短窗口时按旧模型预压缩。
-    if codex_document_uses_multi_router(provider_doc) {
-        remove_multi_router_context_overrides(live_doc);
-    }
+    // model_context_window / model_auto_compact_token_limit are user-authored
+    // top-level preferences. Preserve existing values when the target provider
+    // does not declare replacements; issue #94 will add proper per-model SSOT.
 }
 
 // 空 official provider 配置表示回到 Codex 默认 provider，同时保留用户全局配置。
@@ -12442,13 +12429,19 @@ experimental_bearer_token = "provider-token"
                 .and_then(|value| value.as_str()),
             Some("cc-switch-model-catalog.json")
         );
-        assert!(
-            parsed.get("model_context_window").is_none(),
-            "MultiRouter must not retain a global window that overrides every routed model"
+        assert_eq!(
+            parsed
+                .get("model_context_window")
+                .and_then(|value| value.as_integer()),
+            Some(262_144),
+            "MultiRouter rewrites must preserve an existing user context window"
         );
-        assert!(
-            parsed.get("model_auto_compact_token_limit").is_none(),
-            "MultiRouter must not retain a fixed compaction threshold across differently sized models"
+        assert_eq!(
+            parsed
+                .get("model_auto_compact_token_limit")
+                .and_then(|value| value.as_integer()),
+            Some(240_000),
+            "MultiRouter rewrites must preserve an existing user compact threshold"
         );
         assert!(
             parsed.get("experimental_bearer_token").is_none(),
@@ -17137,15 +17130,19 @@ base_url = "http://127.0.0.1:15721/v1"
         .expect("prepare config");
         assert!(prepared.contains("model_catalog_json"));
         let prepared_toml: toml::Value = toml::from_str(&prepared).expect("parse prepared config");
-        assert!(
-            prepared_toml.get("model_context_window").is_none(),
-            "MultiRouter must expose each catalog model window instead of one global override"
+        assert_eq!(
+            prepared_toml
+                .get("model_context_window")
+                .and_then(|value| value.as_integer()),
+            Some(128_000),
+            "catalog projection must preserve an existing user context window"
         );
-        assert!(
+        assert_eq!(
             prepared_toml
                 .get("model_auto_compact_token_limit")
-                .is_none(),
-            "a fixed compact limit would mask the selected model's own budget"
+                .and_then(|value| value.as_integer()),
+            Some(96_000),
+            "catalog projection must preserve an existing user compact threshold"
         );
         let provider_models = prepared_toml
             .get("model_providers")

@@ -4,25 +4,161 @@ use crate::proxy::error::ProxyError;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentReplayContext {
+    /// We cannot prove whether this is a root or child request.
+    /// Preserve the existing fail-closed behavior.
+    Unknown,
+    /// Ordinary /root request. Any agent_message in input is replay history.
+    MainThread,
+    /// Active subagent request. `agent_name` is the current Codex agent path,
+    /// e.g. `/root/worker`.
+    Subagent { agent_name: String },
+}
+
+fn agent_replay_context(body: &Value) -> AgentReplayContext {
+    let Some(raw_metadata) = body
+        .get("client_metadata")
+        .and_then(|metadata| metadata.get("x-codex-turn-metadata"))
+    else {
+        return AgentReplayContext::Unknown;
+    };
+
+    let metadata = match raw_metadata {
+        Value::String(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(value) => value,
+            Err(_) => return AgentReplayContext::Unknown,
+        },
+        Value::Object(_) => raw_metadata.clone(),
+        _ => return AgentReplayContext::Unknown,
+    };
+
+    let agent_name = metadata
+        .get("agent_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+
+    let is_subagent = metadata
+        .get("thread_source")
+        .and_then(Value::as_str)
+        == Some("subagent")
+        || metadata
+            .get("subagent_kind")
+            .and_then(Value::as_str)
+            == Some("thread_spawn");
+
+    if is_subagent {
+        return agent_name
+            .map(|agent_name| AgentReplayContext::Subagent {
+                agent_name: agent_name.to_string(),
+            })
+            .unwrap_or(AgentReplayContext::Unknown);
+    }
+
+    if agent_name == Some("/root") {
+        return AgentReplayContext::MainThread;
+    }
+
+    AgentReplayContext::Unknown
+}
+
+fn is_new_task_for_agent(item: &Value, agent_name: &str) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("agent_message")
+        && item.get("recipient").and_then(Value::as_str) == Some(agent_name)
+        && item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("input_text")
+                        && part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| text.starts_with("Message Type: NEW_TASK\n"))
+                })
+            })
+}
+
 /// Project Codex-private `agent_message` items into third-party Responses input.
 ///
 pub(crate) fn project_codex_agent_messages_for_third_party(
     body: &mut Value,
     managed_plaintext_policy: bool,
 ) -> Result<usize, ProxyError> {
+    // Read request identity before mutably borrowing input. This metadata is
+    // request-local only; nothing here mutates Codex's persisted rollout.
+    let replay_context = agent_replay_context(body);
+
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return Ok(0);
     };
 
+    // A subagent can contain older NEW_TASK messages in replay history.
+    // The task that triggered the current turn is the last NEW_TASK addressed
+    // to the current agent path.
+    let current_new_task_index = match &replay_context {
+        AgentReplayContext::Subagent { agent_name } => input
+            .iter()
+            .rposition(|item| is_new_task_for_agent(item, agent_name)),
+        _ => None,
+    };
+
     let mut changed = 0;
-    for item in input {
-        if item.get("type").and_then(Value::as_str) != Some("agent_message") {
+
+    // Walk backwards so removing historical items never invalidates the
+    // precomputed current-task index.
+    for index in (0..input.len()).rev() {
+        if input[index].get("type").and_then(Value::as_str) != Some("agent_message") {
             continue;
         }
 
-        let Some(content) = item.get("content").and_then(Value::as_array) else {
+        let Some(content) = input[index].get("content").and_then(Value::as_array) else {
             return Err(unreadable_agent_payload_error());
         };
+
+        let has_opaque_payload = content.iter().any(|part| {
+            if part.get("type").and_then(Value::as_str) != Some("encrypted_content") {
+                return false;
+            }
+
+            let encrypted_content = part
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            looks_like_codex_fernet_content(encrypted_content)
+                || (!managed_plaintext_policy
+                    && looks_like_codex_opaque_encrypted_content(encrypted_content))
+        });
+
+        if has_opaque_payload {
+            let is_safe_historical_replay = match &replay_context {
+                // Root requests do not have a live NEW_TASK to consume.
+                AgentReplayContext::MainThread => true,
+
+                // In a child request, keep fail-closed specifically for the
+                // NEW_TASK that triggered this turn. Older opaque tasks are
+                // replayed history and may be omitted for a third party.
+                AgentReplayContext::Subagent { .. } => current_new_task_index
+                    .is_some_and(|current_index| index != current_index),
+
+                // Missing/unknown metadata: preserve the old behavior.
+                AgentReplayContext::Unknown => false,
+            };
+
+            if is_safe_historical_replay {
+                input.remove(index);
+                continue;
+            }
+
+            return Err(opaque_agent_payload_error());
+        }
+
+        let content = input[index]
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("agent_message content was validated above");
+
         let mut projected_content = Vec::with_capacity(content.len());
         for part in content {
             match part.get("type").and_then(Value::as_str) {
@@ -31,12 +167,6 @@ pub(crate) fn project_codex_agent_messages_for_third_party(
                         .get("encrypted_content")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    if looks_like_codex_fernet_content(encrypted_content)
-                        || (!managed_plaintext_policy
-                            && looks_like_codex_opaque_encrypted_content(encrypted_content))
-                    {
-                        return Err(opaque_agent_payload_error());
-                    }
                     if !encrypted_content.is_empty() {
                         projected_content.push(json!({
                             "type": "input_text",
@@ -59,7 +189,7 @@ pub(crate) fn project_codex_agent_messages_for_third_party(
             return Err(unreadable_agent_payload_error());
         }
 
-        *item = json!({
+        input[index] = json!({
             "type": "message",
             "role": "user",
             "content": projected_content
@@ -198,6 +328,152 @@ mod tests {
 
         assert!(message.contains("third-party child cannot read opaque Codex agent payload"));
         assert!(!message.contains(&opaque));
+    }
+
+    #[test]
+    fn root_thread_drops_historical_opaque_agent_message() {
+        let mut fernet_token = vec![0_u8; 96];
+        fernet_token[0] = 0x80;
+        let opaque = URL_SAFE_NO_PAD.encode(fernet_token);
+
+        let mut request = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata":
+                    "{\"agent_name\":\"/root\",\"thread_source\":\"user\"}"
+            },
+            "input": [
+                {
+                    "type": "agent_message",
+                    "author": "/root",
+                    "recipient": "/root/old-worker",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Message Type: NEW_TASK\nTask name: /root/old-worker\nSender: /root\nPayload:\n"
+                        },
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": opaque
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "continue on kimi"
+                    }]
+                }
+            ]
+        });
+
+        let changed =
+            project_codex_agent_messages_for_third_party(&mut request, false).unwrap();
+
+        assert_eq!(changed, 0);
+        assert_eq!(request["input"].as_array().unwrap().len(), 1);
+        assert_eq!(request["input"][0]["role"], "user");
+        assert!(!request.to_string().contains(&opaque));
+    }
+
+    #[test]
+    fn subagent_drops_old_opaque_task_but_keeps_latest_plaintext_task() {
+        let mut fernet_token = vec![0_u8; 96];
+        fernet_token[0] = 0x80;
+        let opaque = URL_SAFE_NO_PAD.encode(fernet_token);
+
+        let current_task =
+            "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\ncurrent task";
+
+        let mut request = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata":
+                    "{\"agent_name\":\"/root/worker\",\"thread_source\":\"subagent\",\"subagent_kind\":\"thread_spawn\"}"
+            },
+            "input": [
+                {
+                    "type": "agent_message",
+                    "author": "/root",
+                    "recipient": "/root/worker",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"
+                        },
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": opaque
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "some replayed history"
+                    }]
+                },
+                {
+                    "type": "agent_message",
+                    "author": "/root",
+                    "recipient": "/root/worker",
+                    "content": [{
+                        "type": "input_text",
+                        "text": current_task
+                    }]
+                }
+            ]
+        });
+
+        let changed =
+            project_codex_agent_messages_for_third_party(&mut request, false).unwrap();
+
+        assert_eq!(changed, 1);
+        assert_eq!(request["input"].as_array().unwrap().len(), 2);
+        assert!(!request.to_string().contains(&opaque));
+
+        assert_eq!(request["input"][1]["type"], "message");
+        assert_eq!(request["input"][1]["role"], "user");
+        assert_eq!(request["input"][1]["content"][0]["text"], current_task);
+    }
+
+    #[test]
+    fn subagent_still_rejects_opaque_current_new_task() {
+        let mut fernet_token = vec![0_u8; 96];
+        fernet_token[0] = 0x80;
+        let opaque = URL_SAFE_NO_PAD.encode(fernet_token);
+
+        let mut request = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata":
+                    "{\"agent_name\":\"/root/worker\",\"thread_source\":\"subagent\",\"subagent_kind\":\"thread_spawn\"}"
+            },
+            "input": [{
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"
+                    },
+                    {
+                        "type": "encrypted_content",
+                        "encrypted_content": opaque
+                    }
+                ]
+            }]
+        });
+
+        let error = project_codex_agent_messages_for_third_party(&mut request, false)
+            .expect_err("the active child task must remain fail-closed");
+
+        assert!(error
+            .to_string()
+            .contains("third-party child cannot read opaque Codex agent payload"));
+        assert!(!error.to_string().contains(&opaque));
     }
 
     #[test]
