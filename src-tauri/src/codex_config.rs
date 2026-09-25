@@ -3911,13 +3911,10 @@ fn compile_configured_codex_subagent_roles(
                 .as_ref()
                 .map(|value| value.provider_kind)
                 .unwrap_or(SubagentProviderKind::ThirdParty);
-            let fallback_reasoning =
-                (provider_kind == SubagentProviderKind::ThirdParty && spec.reasoning.is_none())
-                    .then(crate::reasoning_capabilities::unknown_third_party_reasoning_fallback_capability);
-            let reasoning = spec
-                .reasoning
-                .as_ref()
-                .or(fallback_reasoning.as_ref());
+            let fallback_reasoning = (provider_kind == SubagentProviderKind::ThirdParty
+                && spec.reasoning.is_none())
+            .then(crate::reasoning_capabilities::unknown_third_party_reasoning_fallback_capability);
+            let reasoning = spec.reasoning.as_ref().or(fallback_reasoning.as_ref());
 
             SubagentCatalogModel {
                 model: spec.model.clone(),
