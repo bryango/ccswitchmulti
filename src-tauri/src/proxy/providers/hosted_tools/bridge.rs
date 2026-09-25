@@ -82,30 +82,101 @@ pub(crate) fn project_hosted_tools_for_responses_request(
     web_search_enabled: bool,
 ) -> HostedToolLoopConfig {
     let mut config = HostedToolLoopConfig::default();
-    let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) else {
-        return config;
-    };
+    let mut saw_hosted_web_search = false;
+    let mut saw_hosted_image_generation = false;
 
-    for tool in tools.iter_mut() {
-        let Some(kind) = tool.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        if kind == "web_search" && web_search_enabled {
-            config.web_search = Some(web_search::config_from_tool(tool));
-            *tool = web_search::responses_tool_definition();
+    if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
+        let mut projected = Vec::with_capacity(tools.len());
+        for tool in tools.drain(..) {
+            match tool.get("type").and_then(Value::as_str) {
+                Some("web_search") => {
+                    saw_hosted_web_search = true;
+                    if web_search_enabled {
+                        config.web_search = Some(web_search::config_from_tool(&tool));
+                        projected.push(web_search::responses_tool_definition());
+                    }
+                }
+                Some("image_generation") => {
+                    // Native third-party Responses does not yet have a local image
+                    // bridge. Omit the hosted declaration instead of forwarding a
+                    // tool the upstream may reject or silently ignore.
+                    saw_hosted_image_generation = true;
+                }
+                _ => projected.push(tool),
+            }
         }
+        *tools = projected;
     }
 
-    if config.web_search.is_some()
-        && request.pointer("/tool_choice/type").and_then(Value::as_str) == Some("web_search")
+    rewrite_responses_hosted_tool_choice(
+        request,
+        config.web_search.is_some(),
+        saw_hosted_web_search,
+        saw_hosted_image_generation,
+    );
+
+    if request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
     {
-        request["tool_choice"] = json!({
-            "type": "function",
-            "name": web_search::WEB_SEARCH_FUNCTION_NAME
-        });
+        request.as_object_mut().unwrap().remove("tools");
     }
 
     config
+}
+
+fn rewrite_responses_hosted_tool_choice(
+    request: &mut Value,
+    web_search_projected: bool,
+    saw_hosted_web_search: bool,
+    saw_hosted_image_generation: bool,
+) {
+    let Some(choice) = request.get_mut("tool_choice") else {
+        return;
+    };
+
+    let choice_type = choice.get("type").and_then(Value::as_str);
+    match choice_type {
+        Some("web_search") if saw_hosted_web_search => {
+            if web_search_projected {
+                *choice = json!({
+                    "type": "function",
+                    "name": web_search::WEB_SEARCH_FUNCTION_NAME
+                });
+            } else {
+                *choice = json!("auto");
+            }
+        }
+        Some("image_generation") if saw_hosted_image_generation => {
+            *choice = json!("auto");
+        }
+        Some("allowed_tools") => {
+            let Some(allowed) = choice.get_mut("tools").and_then(Value::as_array_mut) else {
+                return;
+            };
+            let mut rewritten = Vec::with_capacity(allowed.len());
+            for tool in allowed.drain(..) {
+                match tool.get("type").and_then(Value::as_str) {
+                    Some("web_search") if saw_hosted_web_search => {
+                        if web_search_projected {
+                            rewritten.push(json!({
+                                "type": "function",
+                                "name": web_search::WEB_SEARCH_FUNCTION_NAME
+                            }));
+                        }
+                    }
+                    Some("image_generation") if saw_hosted_image_generation => {}
+                    _ => rewritten.push(tool),
+                }
+            }
+            *allowed = rewritten;
+            if allowed.is_empty() {
+                *choice = json!("auto");
+            }
+        }
+        _ => {}
+    }
 }
 
 /// A forced hosted-tool choice applies only to the first model round.
@@ -186,7 +257,10 @@ pub(crate) fn scan_responses_hosted_tool_calls(
                     arguments,
                 });
             }
-            Some("custom_tool_call" | "tool_search_call") => {
+            Some(item_type) if item_type.ends_with("_call") => {
+                // Any non-hosted call-like item belongs to the client. This is
+                // intentionally fail-safe for current shell/MCP/computer/file
+                // calls and future Responses call types that CCSM does not know.
                 saw_client_tool = true;
             }
             _ => {}
@@ -748,6 +822,72 @@ mod tests {
     }
 
     #[test]
+    fn project_disabled_native_hosted_tools_are_omitted() {
+        let mut request = json!({
+            "tools": [
+                {"type":"web_search"},
+                {"type":"image_generation"},
+                {"type":"function","name":"shell","parameters":{"type":"object"}}
+            ],
+            "tool_choice": {"type":"web_search"}
+        });
+
+        let config = project_hosted_tools_for_responses_request(&mut request, false);
+
+        assert!(config.is_empty());
+        assert_eq!(request["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(request["tools"][0]["name"], "shell");
+        assert_eq!(request["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn project_allowed_tools_rewrites_hosted_search_and_drops_unowned_image() {
+        let mut request = json!({
+            "tools": [
+                {"type":"web_search"},
+                {"type":"image_generation"},
+                {"type":"function","name":"shell","parameters":{"type":"object"}}
+            ],
+            "tool_choice": {
+                "type":"allowed_tools",
+                "mode":"auto",
+                "tools":[
+                    {"type":"web_search"},
+                    {"type":"image_generation"},
+                    {"type":"function","name":"shell"}
+                ]
+            }
+        });
+
+        let config = project_hosted_tools_for_responses_request(&mut request, true);
+
+        assert!(config.web_search.is_some());
+        assert_eq!(request["tool_choice"]["type"], "allowed_tools");
+        assert_eq!(request["tool_choice"]["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(request["tool_choice"]["tools"][0]["type"], "function");
+        assert_eq!(request["tool_choice"]["tools"][0]["name"], "web_search");
+        assert_eq!(request["tool_choice"]["tools"][1]["name"], "shell");
+    }
+
+    #[test]
+    fn project_empty_allowed_tools_downgrades_to_auto() {
+        let mut request = json!({
+            "tools": [{"type":"web_search"}],
+            "tool_choice": {
+                "type":"allowed_tools",
+                "mode":"auto",
+                "tools":[{"type":"web_search"}]
+            }
+        });
+
+        let config = project_hosted_tools_for_responses_request(&mut request, false);
+
+        assert!(config.is_empty());
+        assert!(request.get("tools").is_none());
+        assert_eq!(request["tool_choice"], "auto");
+    }
+
+    #[test]
     fn scan_responses_hosted_web_search_call() {
         let config = HostedToolLoopConfig {
             web_search: Some(HostedWebSearchConfig::default()),
@@ -795,6 +935,20 @@ mod tests {
                 "type":"tool_search_call",
                 "call_id":"call_tool_search",
                 "arguments":"{}"
+            }),
+            json!({
+                "type":"local_shell_call",
+                "call_id":"call_shell",
+                "command":"pwd"
+            }),
+            json!({
+                "type":"mcp_tool_call",
+                "call_id":"call_mcp",
+                "name":"lookup"
+            }),
+            json!({
+                "type":"future_tool_call",
+                "call_id":"call_future"
             }),
         ] {
             let response = json!({

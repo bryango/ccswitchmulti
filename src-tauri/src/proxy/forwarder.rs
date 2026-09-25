@@ -2822,12 +2822,14 @@ impl RequestForwarder {
                 client_requested_streaming,
                 &codex_router_provider.settings_config,
             );
-        let native_responses_hosted_loop_allowed = matches!(app_type, AppType::Codex)
-            && !codex_responses_to_chat
-            && !codex_responses_to_messages
-            && !codex_responses_to_anthropic
-            && codex_third_party_request_policy.is_some()
-            && !super::providers::provider_needs_responses_namespace_flatten(provider)
+        let native_responses_hosted_projection_eligible =
+            matches!(app_type, AppType::Codex)
+                && !codex_responses_to_chat
+                && !codex_responses_to_messages
+                && !codex_responses_to_anthropic
+                && codex_third_party_request_policy.is_some()
+                && !super::providers::provider_needs_responses_namespace_flatten(provider);
+        let native_responses_hosted_loop_allowed = native_responses_hosted_projection_eligible
             && should_enable_hosted_tool_loop(
                 &mapped_body,
                 client_requested_streaming,
@@ -2990,8 +2992,11 @@ impl RequestForwarder {
             }
         } else {
             let mut mapped_body = mapped_body;
-            if native_responses_hosted_loop_allowed {
-                let config = project_hosted_tools_for_responses_request(&mut mapped_body, true);
+            if native_responses_hosted_projection_eligible {
+                let config = project_hosted_tools_for_responses_request(
+                    &mut mapped_body,
+                    native_responses_hosted_loop_allowed,
+                );
                 if !config.is_empty() {
                     native_responses_hosted_tool_config = Some(config);
                 }
@@ -7035,12 +7040,12 @@ where
                 return Ok(ProxyResponse::buffered(status, headers, body_bytes));
             }
             ResponsesHostedToolCallScan::MixedHostedAndClientToolCalls => {
-                return Err(ProxyError::ForwardFailed(
+                return Err(ProxyError::Internal(
                     "third-party Responses returned hosted web_search together with a client-owned tool call; CCSwitchMulti cannot safely split mixed tool ownership in one model turn".to_string(),
                 ));
             }
             ResponsesHostedToolCallScan::InvalidHostedToolCall => {
-                return Err(ProxyError::ForwardFailed(
+                return Err(ProxyError::Internal(
                     "third-party Responses returned a hosted tool call without a usable call_id"
                         .to_string(),
                 ));
@@ -7055,7 +7060,7 @@ where
             log::warn!(
                 "[Codex] Native Responses hosted tool loop reached max iterations ({MAX_HOSTED_TOOL_ITERATIONS})"
             );
-            return Err(ProxyError::ForwardFailed(format!(
+            return Err(ProxyError::Internal(format!(
                 "native Responses hosted tool loop exceeded {MAX_HOSTED_TOOL_ITERATIONS} continuation rounds without producing a client-consumable response"
             )));
         }
@@ -12491,7 +12496,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ProxyError::ForwardFailed(message))
+            Err(ProxyError::Internal(message))
                 if message.contains("mixed tool ownership")
         ));
     }
@@ -12552,7 +12557,7 @@ mod tests {
         assert_eq!(request["tool_choice"], "auto");
         assert!(matches!(
             result,
-            Err(ProxyError::ForwardFailed(message))
+            Err(ProxyError::Internal(message))
                 if message.contains("exceeded")
         ));
     }
