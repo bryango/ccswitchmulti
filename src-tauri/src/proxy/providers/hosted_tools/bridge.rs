@@ -154,9 +154,7 @@ pub(crate) fn scan_responses_hosted_tool_calls(
                 let kind = HostedToolCallKind::from_function_name(name);
                 let is_enabled = match kind {
                     Some(HostedToolCallKind::WebSearch) => config.web_search.is_some(),
-                    Some(HostedToolCallKind::ImageGeneration) => {
-                        config.image_generation.is_some()
-                    }
+                    Some(HostedToolCallKind::ImageGeneration) => config.image_generation.is_some(),
                     None => false,
                 };
                 if !is_enabled {
