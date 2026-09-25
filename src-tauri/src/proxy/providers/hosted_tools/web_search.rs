@@ -125,6 +125,34 @@ pub(crate) fn chat_tool_definition() -> Value {
     })
 }
 
+/// 生成第三方 Responses 上游可理解的普通 function tool。
+///
+/// DeepSeek 等 native Responses 网关不执行 OpenAI hosted `web_search`，但支持
+/// Responses 的 flat function schema。CCSM 用这个本地函数占位，收到调用后再由
+/// hosted-tool client 执行真正的 OpenAI Web Search。
+pub(crate) fn responses_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "name": WEB_SEARCH_FUNCTION_NAME,
+        "description": "Search the web and return concise source-backed results.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The web search query."
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Maximum number of search results to use."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }
+    })
+}
+
 /// 解析第三方模型传回的 `web_search` function arguments。
 ///
 /// 参数:
@@ -358,6 +386,16 @@ mod tests {
 
         assert!(config.external_web_access);
         assert_eq!(config.search_content_types, vec!["image", "text"]);
+    }
+
+    #[test]
+    fn responses_tool_definition_uses_flat_function_shape() {
+        let tool = responses_tool_definition();
+
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], WEB_SEARCH_FUNCTION_NAME);
+        assert!(tool.get("function").is_none());
+        assert_eq!(tool["parameters"]["required"][0], "query");
     }
 
     #[test]

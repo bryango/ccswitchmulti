@@ -8,7 +8,7 @@ use super::{
     },
     openai_client::OpenAiHostedToolClient,
     web_search::{
-        error_tool_content, parse_arguments, query_hash, result_to_tool_content,
+        self, error_tool_content, parse_arguments, query_hash, result_to_tool_content,
         HostedWebSearchConfig, WEB_SEARCH_FUNCTION_NAME,
     },
 };
@@ -61,6 +61,146 @@ pub(crate) enum HostedToolCallScan {
     NoToolCalls,
     OnlyHosted(Vec<HostedToolCall>),
     ContainsUnsupportedToolCalls,
+}
+
+pub(crate) fn project_hosted_tools_for_responses_request(
+    request: &mut Value,
+    web_search_enabled: bool,
+) -> HostedToolLoopConfig {
+    let mut config = HostedToolLoopConfig::default();
+    let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) else {
+        return config;
+    };
+
+    for tool in tools.iter_mut() {
+        let Some(kind) = tool.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if kind == "web_search" && web_search_enabled {
+            config.web_search = Some(web_search::config_from_tool(tool));
+            *tool = web_search::responses_tool_definition();
+        }
+    }
+
+    if config.web_search.is_some()
+        && request.pointer("/tool_choice/type").and_then(Value::as_str) == Some("web_search")
+    {
+        request["tool_choice"] = json!({
+            "type": "function",
+            "name": web_search::WEB_SEARCH_FUNCTION_NAME
+        });
+    }
+
+    config
+}
+
+pub(crate) fn scan_responses_hosted_tool_calls(
+    response: &Value,
+    config: &HostedToolLoopConfig,
+) -> HostedToolCallScan {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return HostedToolCallScan::NoToolCalls;
+    };
+
+    let mut calls = Vec::new();
+    let mut saw_other_function = false;
+
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        let kind = HostedToolCallKind::from_function_name(name);
+        let is_enabled = match kind {
+            Some(HostedToolCallKind::WebSearch) => config.web_search.is_some(),
+            Some(HostedToolCallKind::ImageGeneration) => config.image_generation.is_some(),
+            None => false,
+        };
+        if !is_enabled {
+            saw_other_function = true;
+            continue;
+        }
+        let Some(kind) = kind else {
+            continue;
+        };
+        let id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            return HostedToolCallScan::ContainsUnsupportedToolCalls;
+        }
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}")
+            .to_string();
+        calls.push(HostedToolCall {
+            kind,
+            id,
+            arguments,
+        });
+    }
+
+    if calls.is_empty() {
+        return if saw_other_function {
+            HostedToolCallScan::ContainsUnsupportedToolCalls
+        } else {
+            HostedToolCallScan::NoToolCalls
+        };
+    }
+    if saw_other_function {
+        HostedToolCallScan::ContainsUnsupportedToolCalls
+    } else {
+        HostedToolCallScan::OnlyHosted(calls)
+    }
+}
+
+pub(crate) fn append_tool_outputs_to_responses_request(
+    request: &mut Value,
+    response: &Value,
+    tool_messages: Vec<Value>,
+) -> bool {
+    let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return false;
+    };
+
+    for item in output {
+        if let Some(
+            "reasoning" | "message" | "function_call" | "custom_tool_call" | "tool_search_call",
+        ) = item.get("type").and_then(Value::as_str)
+        {
+            input.push(item.clone());
+        }
+    }
+    for message in tool_messages {
+        let call_id = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let content = message
+            .get("content")
+            .cloned()
+            .unwrap_or(Value::String(String::new()));
+        if call_id.is_empty() {
+            return false;
+        }
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": content
+        }));
+    }
+    if let Some(obj) = request.as_object_mut() {
+        obj.insert("stream".to_string(), json!(false));
+    }
+    true
 }
 
 /// 扫描 Chat response 是否只请求了本地可执行的 hosted tools。
@@ -495,6 +635,93 @@ mod tests {
             scan_hosted_tool_calls(&response),
             HostedToolCallScan::ContainsUnsupportedToolCalls
         );
+    }
+
+    #[test]
+    fn project_hosted_web_search_to_responses_function() {
+        let mut request = json!({
+            "tools": [
+                {"type":"web_search","external_web_access":true,"search_content_types":["text"]},
+                {"type":"function","name":"shell","parameters":{"type":"object"}}
+            ]
+        });
+
+        let config = project_hosted_tools_for_responses_request(&mut request, true);
+
+        assert!(config.web_search.is_some());
+        assert_eq!(request["tools"][0]["type"], "function");
+        assert_eq!(request["tools"][0]["name"], "web_search");
+        assert_eq!(request["tools"][1]["name"], "shell");
+    }
+
+    #[test]
+    fn project_explicit_web_search_choice_to_function_choice() {
+        let mut request = json!({
+            "tools": [{"type":"web_search"}],
+            "tool_choice": {"type":"web_search"}
+        });
+
+        let config = project_hosted_tools_for_responses_request(&mut request, true);
+
+        assert!(config.web_search.is_some());
+        assert_eq!(request["tool_choice"]["type"], "function");
+        assert_eq!(request["tool_choice"]["name"], "web_search");
+    }
+
+    #[test]
+    fn scan_responses_hosted_web_search_call() {
+        let config = HostedToolLoopConfig {
+            web_search: Some(HostedWebSearchConfig::default()),
+            image_generation: None,
+        };
+        let response = json!({
+            "output": [{
+                "type":"function_call",
+                "call_id":"call_search",
+                "name":"web_search",
+                "arguments":"{\"query\":\"Codex\"}"
+            }]
+        });
+
+        assert_eq!(
+            scan_responses_hosted_tool_calls(&response, &config),
+            HostedToolCallScan::OnlyHosted(vec![HostedToolCall {
+                kind: HostedToolCallKind::WebSearch,
+                id: "call_search".to_string(),
+                arguments: "{\"query\":\"Codex\"}".to_string()
+            }])
+        );
+    }
+
+    #[test]
+    fn append_responses_hosted_output_replays_call_and_result() {
+        let mut request = json!({
+            "input":[{"role":"user","content":[{"type":"input_text","text":"Search."}]}]
+        });
+        let response = json!({
+            "output":[{
+                "type":"function_call",
+                "id":"fc_1",
+                "call_id":"call_search",
+                "name":"web_search",
+                "arguments":"{\"query\":\"Codex\"}"
+            }]
+        });
+
+        assert!(append_tool_outputs_to_responses_request(
+            &mut request,
+            &response,
+            vec![json!({
+                "role":"tool",
+                "tool_call_id":"call_search",
+                "content":"{\"summary\":\"ok\"}"
+            })],
+        ));
+
+        assert_eq!(request["input"][1]["type"], "function_call");
+        assert_eq!(request["input"][2]["type"], "function_call_output");
+        assert_eq!(request["input"][2]["call_id"], "call_search");
+        assert_eq!(request["stream"], false);
     }
 
     #[test]

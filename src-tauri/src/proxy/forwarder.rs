@@ -5,9 +5,11 @@
 use super::hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES};
 use super::providers::{
     hosted_tools::bridge::{
-        append_tool_outputs_to_chat_request, execute_hosted_tool_calls, scan_hosted_tool_calls,
-        HostedToolCall, HostedToolCallKind, HostedToolCallScan, HostedToolLoopConfig,
-        HOSTED_TOOL_LOOP_HEADER, MAX_HOSTED_TOOL_ITERATIONS,
+        append_tool_outputs_to_chat_request, append_tool_outputs_to_responses_request,
+        execute_hosted_tool_calls, project_hosted_tools_for_responses_request,
+        scan_hosted_tool_calls, scan_responses_hosted_tool_calls, HostedToolCall,
+        HostedToolCallKind, HostedToolCallScan, HostedToolLoopConfig, HOSTED_TOOL_LOOP_HEADER,
+        MAX_HOSTED_TOOL_ITERATIONS,
     },
     hosted_tools::openai_client::OpenAiHostedToolClient,
     streaming_codex_chat::{
@@ -2819,6 +2821,19 @@ impl RequestForwarder {
                 client_requested_streaming,
                 &codex_router_provider.settings_config,
             );
+        let native_responses_hosted_loop_allowed = matches!(app_type, AppType::Codex)
+            && !codex_responses_to_chat
+            && !codex_responses_to_messages
+            && !codex_responses_to_anthropic
+            && codex_third_party_request_policy.is_some()
+            && !super::providers::provider_needs_responses_namespace_flatten(provider)
+            && should_enable_hosted_tool_loop(
+                &mapped_body,
+                client_requested_streaming,
+                &codex_router_provider.settings_config,
+            )
+            && hosted_tool_bridge_enabled(&codex_router_provider.settings_config, "webSearch");
+        let mut native_responses_hosted_tool_config: Option<HostedToolLoopConfig> = None;
         let mut request_body = if codex_responses_to_chat || codex_responses_to_messages {
             let mut mapped_body = mapped_body;
             let explicit_prompt_cache_key = mapped_body
@@ -2974,6 +2989,12 @@ impl RequestForwarder {
             }
         } else {
             let mut mapped_body = mapped_body;
+            if native_responses_hosted_loop_allowed {
+                let config = project_hosted_tools_for_responses_request(&mut mapped_body, true);
+                if !config.is_empty() {
+                    native_responses_hosted_tool_config = Some(config);
+                }
+            }
             if let Some(policy) = codex_third_party_request_policy.as_ref() {
                 mapped_body = policy.prepare_protocol_body(
                     super::providers::codex_request::CodexRequestTransport::Responses,
@@ -3131,18 +3152,21 @@ impl RequestForwarder {
             }
             filtered_body
         };
-        let hosted_tool_loop_config =
-            codex_chat_tool_context
-                .as_ref()
-                .map(|context| HostedToolLoopConfig {
-                    web_search: context.hosted_web_search_config().cloned(),
-                    image_generation: context.hosted_image_generation_config().cloned(),
-                });
+        let hosted_tool_loop_config = codex_chat_tool_context
+            .as_ref()
+            .map(|context| HostedToolLoopConfig {
+                web_search: context.hosted_web_search_config().cloned(),
+                image_generation: context.hosted_image_generation_config().cloned(),
+            })
+            .or(native_responses_hosted_tool_config);
         let hosted_tool_loop_config = hosted_tool_loop_config.filter(|config| !config.is_empty());
         let hosted_tools_forced_non_stream = codex_responses_to_chat
             && hosted_tool_loop_config.is_some()
             && !client_requested_streaming;
-        if hosted_tools_forced_non_stream {
+        let native_hosted_tools_forced_non_stream = !codex_responses_to_chat
+            && hosted_tool_loop_config.is_some()
+            && client_requested_streaming;
+        if hosted_tools_forced_non_stream || native_hosted_tools_forced_non_stream {
             if let Some(obj) = filtered_body.as_object_mut() {
                 obj.insert("stream".to_string(), serde_json::json!(false));
                 obj.remove("stream_options");
@@ -4463,6 +4487,50 @@ impl RequestForwarder {
                         callback,
                     );
                     ProxyResponse::streamed(StatusCode::OK, response_headers, stream)
+                } else if !codex_responses_to_chat {
+                    let hosted_tool_choice = hosted_tool_choice_name(&filtered_body);
+                    run_hosted_tool_responses_loop(
+                        response,
+                        &mut filtered_body,
+                        config,
+                        &hosted_tool_client,
+                        |body| {
+                            let headers = ordered_headers.clone();
+                            let body_bytes = serde_json::to_vec(body).map_err(|e| {
+                                ProxyError::Internal(format!(
+                                    "Failed to serialize native Responses hosted tool request body: {e}"
+                                ))
+                            });
+                            let trace_id = codex_trace_id.clone();
+                            let session_id = self.session_id.clone();
+                            let model = request_model_for_log.clone();
+                            let provider_id = provider.id.clone();
+                            async move {
+                                let body_bytes = body_bytes?;
+                                if let Some(trace_id) = trace_id.as_deref() {
+                                    super::codex_router_log::append_event(
+                                        "hosted_tool_loop_upstream_send",
+                                        &[
+                                            ("trace", trace_id.to_string()),
+                                            ("session", session_id.clone()),
+                                            ("model", model.clone()),
+                                            ("provider", provider_id.clone()),
+                                            ("request_bytes", body_bytes.len().to_string()),
+                                            ("transport", "responses".to_string()),
+                                        ],
+                                    );
+                                }
+                                send_upstream_request(headers, body_bytes).await
+                            }
+                        },
+                        codex_trace_id.as_deref(),
+                        native_hosted_tools_forced_non_stream,
+                        hosted_tool_choice,
+                        &self.session_id,
+                        &request_model_for_log,
+                        &provider.id,
+                    )
+                    .await?
                 } else {
                     let hosted_tool_choice = hosted_tool_choice_name(&filtered_body);
                     run_hosted_tool_chat_loop(
@@ -6876,6 +6944,101 @@ fn source_codex_oauth_credentials(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     Some((token.to_string(), account_id))
+}
+
+/// 运行 native Responses 上游上的 hosted web_search 本地工具循环。
+///
+/// 第三方 Responses 网关只看到一个普通 `function:web_search`；真正的 OpenAI
+/// hosted Web Search 由 CCSM 执行，并以 `function_call_output` 回灌后续轮次。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the hosted-tool loop makes its security and diagnostic context explicit at the boundary"
+)]
+async fn run_hosted_tool_responses_loop<F, Fut>(
+    mut response: ProxyResponse,
+    responses_request: &mut Value,
+    config: &HostedToolLoopConfig,
+    client: &Result<OpenAiHostedToolClient, String>,
+    mut send_responses_request: F,
+    trace_id: Option<&str>,
+    force_response_header: bool,
+    hosted_tool_choice: Option<&'static str>,
+    session_id: &str,
+    model: &str,
+    provider_id: &str,
+) -> Result<ProxyResponse, ProxyError>
+where
+    F: FnMut(&Value) -> Fut,
+    Fut: std::future::Future<Output = Result<ProxyResponse, ProxyError>>,
+{
+    let mut loop_executed = false;
+
+    for iteration in 0..=MAX_HOSTED_TOOL_ITERATIONS {
+        let (status, mut headers, body_bytes) = read_decoded_proxy_response(response).await?;
+        if force_response_header || loop_executed {
+            mark_hosted_tool_loop_response(&mut headers);
+        }
+        if !status.is_success() {
+            return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+        }
+
+        let responses_response: Value = match serde_json::from_slice(&body_bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                log::warn!(
+                    "[Codex] Native Responses hosted tool loop skipped because response is not JSON"
+                );
+                return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+            }
+        };
+
+        let calls = match scan_responses_hosted_tool_calls(&responses_response, config) {
+            HostedToolCallScan::NoToolCalls => {
+                if let Some(tool) = hosted_tool_choice {
+                    super::providers::hosted_tools::bridge::log_hosted_tool_not_called(
+                        trace_id,
+                        session_id,
+                        model,
+                        provider_id,
+                        tool,
+                        false,
+                    );
+                }
+                return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+            }
+            HostedToolCallScan::ContainsUnsupportedToolCalls => {
+                return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+            }
+            HostedToolCallScan::OnlyHosted(calls) if calls.is_empty() => {
+                return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+            }
+            HostedToolCallScan::OnlyHosted(calls) => calls,
+        };
+
+        if iteration >= MAX_HOSTED_TOOL_ITERATIONS {
+            log::warn!(
+                "[Codex] Native Responses hosted tool loop reached max iterations ({MAX_HOSTED_TOOL_ITERATIONS})"
+            );
+            return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+        }
+
+        let tool_messages = execute_hosted_tool_calls(&calls, config, client, trace_id).await;
+        if !append_tool_outputs_to_responses_request(
+            responses_request,
+            &responses_response,
+            tool_messages,
+        ) {
+            log::warn!(
+                "[Codex] Native Responses hosted tool loop could not append function_call_output"
+            );
+            return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+        }
+
+        loop_executed = true;
+        response = send_responses_request(responses_request).await?;
+    }
+
+    unreachable!("native Responses hosted tool loop always returns inside bounded iteration")
 }
 
 /// 运行 Chat 上游上的 hosted tools 本地工具循环。
@@ -12138,6 +12301,100 @@ mod tests {
 
         let settings = serde_json::json!({});
         assert!(should_enable_hosted_tool_loop(&request, false, &settings));
+    }
+
+    #[tokio::test]
+    async fn native_responses_hosted_web_search_loop_appends_output_and_marks_response() {
+        use crate::proxy::providers::hosted_tools::web_search::HostedWebSearchConfig;
+
+        let initial_response = ProxyResponse::buffered(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from(
+                json!({
+                    "id": "resp_search",
+                    "status": "completed",
+                    "model": "deepseek-flash",
+                    "output": [{
+                        "type": "function_call",
+                        "id": "fc_search",
+                        "call_id": "call_search",
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"\"}"
+                    }]
+                })
+                .to_string(),
+            ),
+        );
+        let mut request = json!({
+            "model": "deepseek-flash",
+            "input": [{"role":"user","content":[{"type":"input_text","text":"Search."}]}],
+            "tools": [crate::proxy::providers::hosted_tools::web_search::responses_tool_definition()],
+            "stream": false
+        });
+        let sent_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent_bodies_for_closure = sent_bodies.clone();
+
+        let final_response = run_hosted_tool_responses_loop(
+            initial_response,
+            &mut request,
+            &HostedToolLoopConfig {
+                web_search: Some(HostedWebSearchConfig::default()),
+                image_generation: None,
+            },
+            &Err("test no credentials".to_string()),
+            move |body| {
+                let sent_bodies = sent_bodies_for_closure.clone();
+                let body = body.clone();
+                async move {
+                    sent_bodies.lock().unwrap().push(body);
+                    Ok(ProxyResponse::buffered(
+                        StatusCode::OK,
+                        HeaderMap::new(),
+                        Bytes::from(
+                            json!({
+                                "id": "resp_final",
+                                "status": "completed",
+                                "model": "deepseek-flash",
+                                "output": [{
+                                    "type":"message",
+                                    "role":"assistant",
+                                    "content":[{
+                                        "type":"output_text",
+                                        "text":"Search was unavailable."
+                                    }]
+                                }]
+                            })
+                            .to_string(),
+                        ),
+                    ))
+                }
+            },
+            None,
+            true,
+            None,
+            "session",
+            "deepseek-flash",
+            "provider",
+        )
+        .await
+        .expect("native hosted web_search loop should finish");
+
+        assert_eq!(final_response.status(), StatusCode::OK);
+        assert!(final_response
+            .headers()
+            .contains_key(HOSTED_TOOL_LOOP_HEADER));
+
+        let sent = sent_bodies.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["stream"], false);
+        let input = sent[0]["input"].as_array().expect("responses input");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_search");
+        assert!(input[2]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("error")));
     }
 
     /// 验证 hosted web_search loop 会消费第一轮工具调用、回灌 tool output 并返回最终 Chat 响应。
