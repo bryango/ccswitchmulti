@@ -7,8 +7,9 @@ use super::providers::{
     hosted_tools::bridge::{
         append_tool_outputs_to_chat_request, append_tool_outputs_to_responses_request,
         execute_hosted_tool_calls, project_hosted_tools_for_responses_request,
-        scan_hosted_tool_calls, scan_responses_hosted_tool_calls, HostedToolCall,
-        HostedToolCallKind, HostedToolCallScan, HostedToolLoopConfig, HOSTED_TOOL_LOOP_HEADER,
+        relax_hosted_tool_choice_for_responses_request, scan_hosted_tool_calls,
+        scan_responses_hosted_tool_calls, HostedToolCall, HostedToolCallKind, HostedToolCallScan,
+        HostedToolLoopConfig, ResponsesHostedToolCallScan, HOSTED_TOOL_LOOP_HEADER,
         MAX_HOSTED_TOOL_ITERATIONS,
     },
     hosted_tools::openai_client::OpenAiHostedToolClient,
@@ -7015,33 +7016,48 @@ where
         }
 
         let calls = match scan_responses_hosted_tool_calls(&responses_response, config) {
-            HostedToolCallScan::NoToolCalls => {
-                if let Some(tool) = hosted_tool_choice {
-                    super::providers::hosted_tools::bridge::log_hosted_tool_not_called(
-                        trace_id,
-                        session_id,
-                        model,
-                        provider_id,
-                        tool,
-                        false,
-                    );
+            ResponsesHostedToolCallScan::NoToolCalls => {
+                if !loop_executed {
+                    if let Some(tool) = hosted_tool_choice {
+                        super::providers::hosted_tools::bridge::log_hosted_tool_not_called(
+                            trace_id,
+                            session_id,
+                            model,
+                            provider_id,
+                            tool,
+                            false,
+                        );
+                    }
                 }
                 return Ok(ProxyResponse::buffered(status, headers, body_bytes));
             }
-            HostedToolCallScan::ContainsUnsupportedToolCalls => {
+            ResponsesHostedToolCallScan::OnlyClientToolCalls => {
                 return Ok(ProxyResponse::buffered(status, headers, body_bytes));
             }
-            HostedToolCallScan::OnlyHosted(calls) if calls.is_empty() => {
+            ResponsesHostedToolCallScan::MixedHostedAndClientToolCalls => {
+                return Err(ProxyError::ForwardFailed(
+                    "third-party Responses returned hosted web_search together with a client-owned tool call; CCSwitchMulti cannot safely split mixed tool ownership in one model turn".to_string(),
+                ));
+            }
+            ResponsesHostedToolCallScan::InvalidHostedToolCall => {
+                return Err(ProxyError::ForwardFailed(
+                    "third-party Responses returned a hosted tool call without a usable call_id"
+                        .to_string(),
+                ));
+            }
+            ResponsesHostedToolCallScan::OnlyHosted(calls) if calls.is_empty() => {
                 return Ok(ProxyResponse::buffered(status, headers, body_bytes));
             }
-            HostedToolCallScan::OnlyHosted(calls) => calls,
+            ResponsesHostedToolCallScan::OnlyHosted(calls) => calls,
         };
 
         if iteration >= MAX_HOSTED_TOOL_ITERATIONS {
             log::warn!(
                 "[Codex] Native Responses hosted tool loop reached max iterations ({MAX_HOSTED_TOOL_ITERATIONS})"
             );
-            return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+            return Err(ProxyError::ForwardFailed(format!(
+                "native Responses hosted tool loop exceeded {MAX_HOSTED_TOOL_ITERATIONS} continuation rounds without producing a client-consumable response"
+            )));
         }
 
         let tool_messages = execute_hosted_tool_calls(&calls, config, client, trace_id).await;
@@ -7055,6 +7071,7 @@ where
             );
             return Ok(ProxyResponse::buffered(status, headers, body_bytes));
         }
+        relax_hosted_tool_choice_for_responses_request(responses_request, config);
 
         loop_executed = true;
         response = send_responses_request(responses_request).await?;
@@ -12352,6 +12369,7 @@ mod tests {
             "model": "deepseek-flash",
             "input": [{"role":"user","content":[{"type":"input_text","text":"Search."}]}],
             "tools": [crate::proxy::providers::hosted_tools::web_search::responses_tool_definition()],
+            "tool_choice": {"type":"function","name":"web_search"},
             "stream": false
         });
         let sent_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -12410,6 +12428,7 @@ mod tests {
         let sent = sent_bodies.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["stream"], false);
+        assert_eq!(sent[0]["tool_choice"], "auto");
         let input = sent[0]["input"].as_array().expect("responses input");
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[2]["type"], "function_call_output");
@@ -12417,6 +12436,125 @@ mod tests {
         assert!(input[2]["output"]
             .as_str()
             .is_some_and(|output| output.contains("error")));
+    }
+
+    #[tokio::test]
+    async fn native_responses_hosted_loop_rejects_mixed_tool_ownership() {
+        use crate::proxy::providers::hosted_tools::web_search::HostedWebSearchConfig;
+
+        let initial_response = ProxyResponse::buffered(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from(
+                json!({
+                    "output": [
+                        {
+                            "type":"function_call",
+                            "call_id":"call_search",
+                            "name":"web_search",
+                            "arguments":"{\"query\":\"Codex\"}"
+                        },
+                        {
+                            "type":"custom_tool_call",
+                            "call_id":"call_patch",
+                            "name":"apply_patch",
+                            "input":"*** Begin Patch"
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+        );
+        let mut request = json!({"input":[],"stream":false});
+
+        let result = run_hosted_tool_responses_loop(
+            initial_response,
+            &mut request,
+            &HostedToolLoopConfig {
+                web_search: Some(HostedWebSearchConfig::default()),
+                image_generation: None,
+            },
+            &Err("unused".to_string()),
+            |_body| async {
+                Err(ProxyError::Internal(
+                    "mixed ownership must not continue upstream".to_string(),
+                ))
+            },
+            None,
+            false,
+            None,
+            "session",
+            "deepseek-flash",
+            "provider",
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ProxyError::ForwardFailed(message))
+                if message.contains("mixed tool ownership")
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_responses_hosted_loop_errors_at_iteration_cap() {
+        use crate::proxy::providers::hosted_tools::web_search::HostedWebSearchConfig;
+
+        let hosted_response = json!({
+            "output": [{
+                "type":"function_call",
+                "call_id":"call_search",
+                "name":"web_search",
+                "arguments":"{\"query\":\"\"}"
+            }]
+        })
+        .to_string();
+        let initial_response = ProxyResponse::buffered(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from(hosted_response.clone()),
+        );
+        let mut request = json!({
+            "input":[],
+            "tool_choice":{"type":"function","name":"web_search"},
+            "stream":false
+        });
+        let hosted_response = Arc::new(hosted_response);
+        let hosted_response_for_closure = hosted_response.clone();
+
+        let result = run_hosted_tool_responses_loop(
+            initial_response,
+            &mut request,
+            &HostedToolLoopConfig {
+                web_search: Some(HostedWebSearchConfig::default()),
+                image_generation: None,
+            },
+            &Err("test no credentials".to_string()),
+            move |_body| {
+                let body = hosted_response_for_closure.clone();
+                async move {
+                    Ok(ProxyResponse::buffered(
+                        StatusCode::OK,
+                        HeaderMap::new(),
+                        Bytes::from(body.as_str().to_string()),
+                    ))
+                }
+            },
+            None,
+            false,
+            Some("web_search"),
+            "session",
+            "deepseek-flash",
+            "provider",
+        )
+        .await;
+
+        assert_eq!(request["tool_choice"], "auto");
+        assert!(matches!(
+            result,
+            Err(ProxyError::ForwardFailed(message))
+                if message.contains("exceeded")
+        ));
     }
 
     /// 验证 hosted web_search loop 会消费第一轮工具调用、回灌 tool output 并返回最终 Chat 响应。

@@ -63,6 +63,20 @@ pub(crate) enum HostedToolCallScan {
     ContainsUnsupportedToolCalls,
 }
 
+/// Native Responses tool ownership classification.
+///
+/// CCSM may continue the request only when every actionable client-side call in
+/// the response belongs to the local hosted-tool bridge. Mixed ownership cannot
+/// be safely split across the local continuation and Codex's own tool executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResponsesHostedToolCallScan {
+    NoToolCalls,
+    OnlyHosted(Vec<HostedToolCall>),
+    OnlyClientToolCalls,
+    MixedHostedAndClientToolCalls,
+    InvalidHostedToolCall,
+}
+
 pub(crate) fn project_hosted_tools_for_responses_request(
     request: &mut Value,
     web_search_enabled: bool,
@@ -94,68 +108,104 @@ pub(crate) fn project_hosted_tools_for_responses_request(
     config
 }
 
+/// A forced hosted-tool choice applies only to the first model round.
+///
+/// Once CCSM has executed that hosted tool and appended its output, the model
+/// must be allowed to answer, request another search, or hand a client-owned
+/// tool back to Codex instead of being deterministically forced to search again.
+pub(crate) fn relax_hosted_tool_choice_for_responses_request(
+    request: &mut Value,
+    config: &HostedToolLoopConfig,
+) {
+    let Some(choice) = request.get("tool_choice") else {
+        return;
+    };
+    if choice.get("type").and_then(Value::as_str) != Some("function") {
+        return;
+    }
+    let Some(name) = choice.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    let enabled_hosted_tool = match HostedToolCallKind::from_function_name(name) {
+        Some(HostedToolCallKind::WebSearch) => config.web_search.is_some(),
+        Some(HostedToolCallKind::ImageGeneration) => config.image_generation.is_some(),
+        None => false,
+    };
+    if enabled_hosted_tool {
+        request["tool_choice"] = json!("auto");
+    }
+}
+
 pub(crate) fn scan_responses_hosted_tool_calls(
     response: &Value,
     config: &HostedToolLoopConfig,
-) -> HostedToolCallScan {
+) -> ResponsesHostedToolCallScan {
     let Some(output) = response.get("output").and_then(Value::as_array) else {
-        return HostedToolCallScan::NoToolCalls;
+        return ResponsesHostedToolCallScan::NoToolCalls;
     };
 
     let mut calls = Vec::new();
-    let mut saw_other_function = false;
+    let mut saw_client_tool = false;
 
     for item in output {
-        if item.get("type").and_then(Value::as_str) != Some("function_call") {
-            continue;
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                let kind = HostedToolCallKind::from_function_name(name);
+                let is_enabled = match kind {
+                    Some(HostedToolCallKind::WebSearch) => config.web_search.is_some(),
+                    Some(HostedToolCallKind::ImageGeneration) => {
+                        config.image_generation.is_some()
+                    }
+                    None => false,
+                };
+                if !is_enabled {
+                    saw_client_tool = true;
+                    continue;
+                }
+                let Some(kind) = kind else {
+                    saw_client_tool = true;
+                    continue;
+                };
+                let id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| item.get("id").and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    return ResponsesHostedToolCallScan::InvalidHostedToolCall;
+                }
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}")
+                    .to_string();
+                calls.push(HostedToolCall {
+                    kind,
+                    id,
+                    arguments,
+                });
+            }
+            Some("custom_tool_call" | "tool_search_call") => {
+                saw_client_tool = true;
+            }
+            _ => {}
         }
-        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-        let kind = HostedToolCallKind::from_function_name(name);
-        let is_enabled = match kind {
-            Some(HostedToolCallKind::WebSearch) => config.web_search.is_some(),
-            Some(HostedToolCallKind::ImageGeneration) => config.image_generation.is_some(),
-            None => false,
-        };
-        if !is_enabled {
-            saw_other_function = true;
-            continue;
-        }
-        let Some(kind) = kind else {
-            continue;
-        };
-        let id = item
-            .get("call_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .or_else(|| item.get("id").and_then(Value::as_str))
-            .unwrap_or("")
-            .to_string();
-        if id.is_empty() {
-            return HostedToolCallScan::ContainsUnsupportedToolCalls;
-        }
-        let arguments = item
-            .get("arguments")
-            .and_then(Value::as_str)
-            .unwrap_or("{}")
-            .to_string();
-        calls.push(HostedToolCall {
-            kind,
-            id,
-            arguments,
-        });
     }
 
     if calls.is_empty() {
-        return if saw_other_function {
-            HostedToolCallScan::ContainsUnsupportedToolCalls
+        return if saw_client_tool {
+            ResponsesHostedToolCallScan::OnlyClientToolCalls
         } else {
-            HostedToolCallScan::NoToolCalls
+            ResponsesHostedToolCallScan::NoToolCalls
         };
     }
-    if saw_other_function {
-        HostedToolCallScan::ContainsUnsupportedToolCalls
+    if saw_client_tool {
+        ResponsesHostedToolCallScan::MixedHostedAndClientToolCalls
     } else {
-        HostedToolCallScan::OnlyHosted(calls)
+        ResponsesHostedToolCallScan::OnlyHosted(calls)
     }
 }
 
@@ -179,27 +229,35 @@ pub(crate) fn append_tool_outputs_to_responses_request(
         .collect::<Vec<_>>();
 
     for item in output {
-        if let Some(
-            "reasoning" | "message" | "function_call" | "custom_tool_call" | "tool_search_call",
-        ) = item.get("type").and_then(Value::as_str)
-        {
-            let mut replay = item.clone();
-            if replay.get("type").and_then(Value::as_str) == Some("function_call")
-                && replay
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning" | "message") => input.push(item.clone()),
+            Some("function_call") => {
+                let replay_call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|call_id| !call_id.is_empty())
+                    .or_else(|| item.get("id").and_then(Value::as_str));
+                let Some(replay_call_id) = replay_call_id else {
+                    continue;
+                };
+                if !hosted_call_ids
+                    .iter()
+                    .any(|call_id| call_id == replay_call_id)
+                {
+                    continue;
+                }
+
+                let mut replay = item.clone();
+                if replay
                     .get("call_id")
                     .and_then(Value::as_str)
                     .is_none_or(str::is_empty)
-            {
-                let fallback_id = replay
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| hosted_call_ids.iter().any(|call_id| call_id == id))
-                    .map(ToString::to_string);
-                if let Some(call_id) = fallback_id {
-                    replay["call_id"] = Value::String(call_id);
+                {
+                    replay["call_id"] = Value::String(replay_call_id.to_string());
                 }
+                input.push(replay);
             }
-            input.push(replay);
+            _ => {}
         }
     }
     for message in tool_messages {
@@ -708,12 +766,135 @@ mod tests {
 
         assert_eq!(
             scan_responses_hosted_tool_calls(&response, &config),
-            HostedToolCallScan::OnlyHosted(vec![HostedToolCall {
+            ResponsesHostedToolCallScan::OnlyHosted(vec![HostedToolCall {
                 kind: HostedToolCallKind::WebSearch,
                 id: "call_search".to_string(),
                 arguments: "{\"query\":\"Codex\"}".to_string()
             }])
         );
+    }
+
+    #[test]
+    fn scan_responses_hosted_calls_detects_mixed_client_tool_ownership() {
+        let config = HostedToolLoopConfig {
+            web_search: Some(HostedWebSearchConfig::default()),
+            image_generation: None,
+        };
+        for client_item in [
+            json!({
+                "type":"function_call",
+                "call_id":"call_shell",
+                "name":"shell",
+                "arguments":"{}"
+            }),
+            json!({
+                "type":"custom_tool_call",
+                "call_id":"call_patch",
+                "name":"apply_patch",
+                "input":"*** Begin Patch"
+            }),
+            json!({
+                "type":"tool_search_call",
+                "call_id":"call_tool_search",
+                "arguments":"{}"
+            }),
+        ] {
+            let response = json!({
+                "output": [
+                    {
+                        "type":"function_call",
+                        "call_id":"call_search",
+                        "name":"web_search",
+                        "arguments":"{\"query\":\"Codex\"}"
+                    },
+                    client_item
+                ]
+            });
+
+            assert_eq!(
+                scan_responses_hosted_tool_calls(&response, &config),
+                ResponsesHostedToolCallScan::MixedHostedAndClientToolCalls
+            );
+        }
+    }
+
+    #[test]
+    fn scan_responses_client_tool_only_is_pass_through() {
+        let config = HostedToolLoopConfig {
+            web_search: Some(HostedWebSearchConfig::default()),
+            image_generation: None,
+        };
+        let response = json!({
+            "output": [{
+                "type":"custom_tool_call",
+                "call_id":"call_patch",
+                "name":"apply_patch",
+                "input":"*** Begin Patch"
+            }]
+        });
+
+        assert_eq!(
+            scan_responses_hosted_tool_calls(&response, &config),
+            ResponsesHostedToolCallScan::OnlyClientToolCalls
+        );
+    }
+
+    #[test]
+    fn relax_responses_hosted_tool_choice_after_first_round() {
+        let mut request = json!({
+            "tool_choice": {"type":"function","name":"web_search"}
+        });
+        let config = HostedToolLoopConfig {
+            web_search: Some(HostedWebSearchConfig::default()),
+            image_generation: None,
+        };
+
+        relax_hosted_tool_choice_for_responses_request(&mut request, &config);
+
+        assert_eq!(request["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn append_responses_hosted_output_does_not_replay_client_owned_calls() {
+        let mut request = json!({"input":[]});
+        let response = json!({
+            "output": [
+                {
+                    "type":"custom_tool_call",
+                    "call_id":"call_patch",
+                    "name":"apply_patch",
+                    "input":"*** Begin Patch"
+                },
+                {
+                    "type":"tool_search_call",
+                    "call_id":"call_tool_search",
+                    "arguments":"{}"
+                },
+                {
+                    "type":"function_call",
+                    "call_id":"call_search",
+                    "name":"web_search",
+                    "arguments":"{}"
+                }
+            ]
+        });
+
+        assert!(append_tool_outputs_to_responses_request(
+            &mut request,
+            &response,
+            vec![json!({
+                "role":"tool",
+                "tool_call_id":"call_search",
+                "content":"{}"
+            })],
+        ));
+
+        let input = request["input"].as_array().expect("responses input");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_search");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_search");
     }
 
     #[test]
