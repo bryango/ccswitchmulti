@@ -3188,6 +3188,16 @@ pub fn resolve_codex_chat_reasoning_config(
 
     // 3. 检测/能力库/内置第三优先级。
     if let Some(capability) = resolved.capability {
+        // Unknown-source capabilities are synthetic third-party fallbacks. If
+        // we already know a platform/model adapter, keep its wire format
+        // authoritative and use the fallback only as the UI/Sub-Agent effort
+        // contract. Otherwise fall back to top-level reasoning_effort.
+        if resolved.source == crate::reasoning_capabilities::CapabilitySource::Unknown {
+            if let Some(inferred) = inferred {
+                return Some(inferred);
+            }
+        }
+
         let config = codex_chat_reasoning_config_from_capability(capability);
         return Some(match inferred {
             Some(inferred) => apply_qwen_vllm_safety_defaults(config, &inferred),
@@ -7516,6 +7526,53 @@ wire_api = "chat"
         assert_eq!(config.supports_thinking, Some(false));
         assert_eq!(config.supports_effort, Some(false));
         assert_eq!(config.thinking_param.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn test_resolve_codex_chat_reasoning_unknown_uses_platform_inference() {
+        let provider = create_provider(json!({
+            "config": r#"
+model_provider = "openrouter"
+model = "mystery-model"
+
+[model_providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+wire_api = "chat"
+"#
+        }));
+
+        let config =
+            resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "mystery-model" }))
+                .expect("platform inference");
+
+        assert_eq!(config.effort_param.as_deref(), Some("reasoning.effort"));
+        assert_eq!(config.effort_value_mode.as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    fn test_resolve_codex_chat_reasoning_unknown_without_inference_uses_fallback() {
+        let provider = create_provider(json!({
+            "config": r#"
+model_provider = "generic"
+model = "mystery-model"
+
+[model_providers.generic]
+name = "Generic"
+base_url = "https://example.com/v1"
+wire_api = "chat"
+"#
+        }));
+
+        let config =
+            resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "mystery-model" }))
+                .expect("fallback reasoning config");
+
+        assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
+        assert!(config
+            .effort_value_mode
+            .as_deref()
+            .is_some_and(|mode| mode.starts_with("capability|") && mode.contains("max=max")));
     }
 
     #[test]
