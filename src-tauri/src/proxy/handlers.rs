@@ -3110,6 +3110,7 @@ async fn handle_responses_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
+    let native_hosted_tool_loop_response = response.headers().contains_key(HOSTED_TOOL_LOOP_HEADER);
     let desktop_reasoning_mapping = desktop_reasoning
         && super::providers::resolve_codex_native_responses_reasoning_projection(
             &ctx.provider,
@@ -3177,6 +3178,60 @@ async fn handle_responses_for_app(
             is_codex_v2_compaction,
             connection_guard,
             codex_tool_context,
+        )
+        .await;
+    }
+
+    if native_hosted_tool_loop_response && response.status().is_success() {
+        let (mut response_headers, status, body_bytes) =
+            read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
+        response_headers.remove(HOSTED_TOOL_LOOP_HEADER);
+        strip_entity_headers_for_rebuilt_body(&mut response_headers);
+
+        if is_stream {
+            let mut value: Value = serde_json::from_slice(&body_bytes).map_err(|error| {
+                ProxyError::TransformError(format!(
+                    "Failed to parse native Responses hosted-tool result: {error}"
+                ))
+            })?;
+            if desktop_reasoning_mapping {
+                map_completed_response_for_desktop(&mut value);
+            }
+            state
+                .codex_chat_history
+                .record_exchange(&request_body_for_history, &value)
+                .await;
+            let sse = responses_response_to_full_sse(&value)?;
+            response_headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/event-stream"),
+            );
+            response_headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-cache"),
+            );
+            let response =
+                super::hyper_client::ProxyResponse::buffered(status, response_headers, sse);
+            return process_response_with_stream_hint(
+                response,
+                &ctx,
+                &state,
+                &CODEX_PARSER_CONFIG,
+                connection_guard,
+                true,
+            )
+            .await;
+        }
+
+        let response =
+            super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes);
+        return process_response_with_stream_hint(
+            response,
+            &ctx,
+            &state,
+            &CODEX_PARSER_CONFIG,
+            connection_guard,
+            false,
         )
         .await;
     }
