@@ -1319,7 +1319,9 @@ mod tests {
                 .expect_err("provider add still requires provider-set probe evidence");
 
             assert!(
-                error.to_string().contains("codex_provider_set_probe_required"),
+                error
+                    .to_string()
+                    .contains("codex_provider_set_probe_required"),
                 "unknown reasoning should no longer be the blocking gate: {error}"
             );
             assert!(state
@@ -1353,7 +1355,9 @@ mod tests {
                 .expect_err("provider update still requires provider-set probe evidence");
 
             assert!(
-                error.to_string().contains("codex_provider_set_probe_required"),
+                error
+                    .to_string()
+                    .contains("codex_provider_set_probe_required"),
                 "unknown reasoning should no longer be the blocking gate: {error}"
             );
             let saved = state
