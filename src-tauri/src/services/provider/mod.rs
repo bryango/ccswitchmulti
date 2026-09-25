@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn add_allows_unknown_third_party_reasoning_with_fallback() {
+    fn add_unknown_third_party_reasoning_reaches_probe_gate() {
         with_test_home(|state, _| {
             let provider = Provider::with_id(
                 "codex-unknown-reasoning-add".to_string(),
@@ -1314,23 +1314,25 @@ mod tests {
                 codex_settings_with_unknown_subagent("https://api.example.com/v1", "sk-test"),
                 None,
             );
-            let expected_settings = provider.settings_config.clone();
 
-            ProviderService::add(state, AppType::Codex, provider, false)
-                .expect("provider add should accept inferred third-party reasoning");
+            let error = ProviderService::add(state, AppType::Codex, provider, false)
+                .expect_err("provider add still requires provider-set probe evidence");
 
-            let saved = state
+            assert!(
+                error.to_string().contains("codex_provider_set_probe_required"),
+                "unknown reasoning should no longer be the blocking gate: {error}"
+            );
+            assert!(state
                 .db
                 .get_provider_by_id("codex-unknown-reasoning-add", AppType::Codex.as_str())
-                .expect("query added provider")
-                .expect("provider must be persisted");
-            assert_eq!(saved.settings_config, expected_settings);
+                .expect("query rejected provider")
+                .is_none());
         });
     }
 
     #[test]
     #[serial]
-    fn update_allows_unknown_third_party_reasoning_with_fallback() {
+    fn update_unknown_third_party_reasoning_reaches_probe_gate() {
         with_test_home(|state, _| {
             let provider = Provider::with_id(
                 "codex-unknown-reasoning-update".to_string(),
@@ -1346,17 +1348,20 @@ mod tests {
             let mut updated = provider.clone();
             updated.settings_config =
                 codex_settings_with_unknown_subagent("https://api.example.com/v1", "sk-new");
-            let expected_settings = updated.settings_config.clone();
 
-            ProviderService::update(state, AppType::Codex, None, updated)
-                .expect("provider update should accept inferred third-party reasoning");
+            let error = ProviderService::update(state, AppType::Codex, None, updated)
+                .expect_err("provider update still requires provider-set probe evidence");
 
+            assert!(
+                error.to_string().contains("codex_provider_set_probe_required"),
+                "unknown reasoning should no longer be the blocking gate: {error}"
+            );
             let saved = state
                 .db
                 .get_provider_by_id("codex-unknown-reasoning-update", AppType::Codex.as_str())
-                .expect("query provider after update")
-                .expect("updated provider remains persisted");
-            assert_eq!(saved.settings_config, expected_settings);
+                .expect("query provider after rejected update")
+                .expect("seed provider remains persisted");
+            assert_eq!(saved.settings_config, provider.settings_config);
         });
     }
 
