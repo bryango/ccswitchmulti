@@ -4489,6 +4489,15 @@ impl RequestForwarder {
                     ProxyResponse::streamed(StatusCode::OK, response_headers, stream)
                 } else if !codex_responses_to_chat {
                     let hosted_tool_choice = hosted_tool_choice_name(&filtered_body);
+                    let continuation_policy = codex_third_party_request_policy.clone();
+                    let continuation_options =
+                        super::providers::codex_request::CodexRequestOptions {
+                            tool_schema_dialect: codex_request_compatibility
+                                .map(|compatibility| compatibility.tool_schema_dialect),
+                            history_replay: codex_request_compatibility
+                                .map(|compatibility| compatibility.history_replay),
+                            ..super::providers::codex_request::CodexRequestOptions::default()
+                        };
                     run_hosted_tool_responses_loop(
                         response,
                         &mut filtered_body,
@@ -4496,7 +4505,20 @@ impl RequestForwarder {
                         &hosted_tool_client,
                         |body| {
                             let headers = ordered_headers.clone();
-                            let body_bytes = serde_json::to_vec(body).map_err(|e| {
+                            let mut continuation_body = continuation_policy
+                                .as_ref()
+                                .map(|policy| {
+                                    policy.finalize_responses_continuation_body(
+                                        body.clone(),
+                                        &continuation_options,
+                                    )
+                                })
+                                .unwrap_or_else(|| body.clone());
+                            if let Some(obj) = continuation_body.as_object_mut() {
+                                obj.insert("stream".to_string(), serde_json::json!(false));
+                                obj.remove("stream_options");
+                            }
+                            let body_bytes = serde_json::to_vec(&continuation_body).map_err(|e| {
                                 ProxyError::Internal(format!(
                                     "Failed to serialize native Responses hosted tool request body: {e}"
                                 ))
@@ -6975,9 +6997,6 @@ where
 
     for iteration in 0..=MAX_HOSTED_TOOL_ITERATIONS {
         let (status, mut headers, body_bytes) = read_decoded_proxy_response(response).await?;
-        if force_response_header || loop_executed {
-            mark_hosted_tool_loop_response(&mut headers);
-        }
         if !status.is_success() {
             return Ok(ProxyResponse::buffered(status, headers, body_bytes));
         }
@@ -6991,6 +7010,9 @@ where
                 return Ok(ProxyResponse::buffered(status, headers, body_bytes));
             }
         };
+        if force_response_header || loop_executed {
+            mark_hosted_tool_loop_response(&mut headers);
+        }
 
         let calls = match scan_responses_hosted_tool_calls(&responses_response, config) {
             HostedToolCallScan::NoToolCalls => {

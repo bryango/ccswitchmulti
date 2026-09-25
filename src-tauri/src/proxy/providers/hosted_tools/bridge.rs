@@ -171,12 +171,35 @@ pub(crate) fn append_tool_outputs_to_responses_request(
         return false;
     };
 
+    let hosted_call_ids = tool_messages
+        .iter()
+        .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
+        .filter(|call_id| !call_id.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
     for item in output {
         if let Some(
             "reasoning" | "message" | "function_call" | "custom_tool_call" | "tool_search_call",
         ) = item.get("type").and_then(Value::as_str)
         {
-            input.push(item.clone());
+            let mut replay = item.clone();
+            if replay.get("type").and_then(Value::as_str) == Some("function_call")
+                && replay
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                let fallback_id = replay
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| hosted_call_ids.iter().any(|call_id| call_id == id))
+                    .map(ToString::to_string);
+                if let Some(call_id) = fallback_id {
+                    replay["call_id"] = Value::String(call_id);
+                }
+            }
+            input.push(replay);
         }
     }
     for message in tool_messages {
@@ -722,6 +745,32 @@ mod tests {
         assert_eq!(request["input"][2]["type"], "function_call_output");
         assert_eq!(request["input"][2]["call_id"], "call_search");
         assert_eq!(request["stream"], false);
+    }
+
+    #[test]
+    fn append_responses_hosted_output_injects_fallback_call_id() {
+        let mut request = json!({"input":[]});
+        let response = json!({
+            "output":[{
+                "type":"function_call",
+                "id":"fc_search",
+                "name":"web_search",
+                "arguments":"{}"
+            }]
+        });
+
+        assert!(append_tool_outputs_to_responses_request(
+            &mut request,
+            &response,
+            vec![json!({
+                "role":"tool",
+                "tool_call_id":"fc_search",
+                "content":"{}"
+            })],
+        ));
+
+        assert_eq!(request["input"][0]["call_id"], "fc_search");
+        assert_eq!(request["input"][1]["call_id"], "fc_search");
     }
 
     #[test]

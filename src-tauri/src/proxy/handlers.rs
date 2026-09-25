@@ -3188,15 +3188,16 @@ async fn handle_responses_for_app(
         response_headers.remove(HOSTED_TOOL_LOOP_HEADER);
         strip_entity_headers_for_rebuilt_body(&mut response_headers);
 
+        let mut value: Value = serde_json::from_slice(&body_bytes).map_err(|error| {
+            ProxyError::TransformError(format!(
+                "Failed to parse native Responses hosted-tool result: {error}"
+            ))
+        })?;
+        if desktop_reasoning_mapping {
+            map_completed_response_for_desktop(&mut value);
+        }
+
         if is_stream {
-            let mut value: Value = serde_json::from_slice(&body_bytes).map_err(|error| {
-                ProxyError::TransformError(format!(
-                    "Failed to parse native Responses hosted-tool result: {error}"
-                ))
-            })?;
-            if desktop_reasoning_mapping {
-                map_completed_response_for_desktop(&mut value);
-            }
             state
                 .codex_chat_history
                 .record_exchange(&request_body_for_history, &value)
@@ -3223,8 +3224,16 @@ async fn handle_responses_for_app(
             .await;
         }
 
-        let response =
-            super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes);
+        let rebuilt = serde_json::to_vec(&value).map_err(|error| {
+            ProxyError::TransformError(format!(
+                "Failed to serialize native Responses hosted-tool result: {error}"
+            ))
+        })?;
+        let response = super::hyper_client::ProxyResponse::buffered(
+            status,
+            response_headers,
+            Bytes::from(rebuilt),
+        );
         return process_response_with_stream_hint(
             response,
             &ctx,

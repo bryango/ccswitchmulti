@@ -229,6 +229,19 @@ impl CodexThirdPartyRequestPolicy {
         apply_provider_body_policy(&self.provider, body)
     }
 
+    /// Re-apply the provider-owned parts of Responses finalization after a local
+    /// hosted-tool continuation mutates `input`.
+    ///
+    /// Tool schemas are unchanged between rounds, so deliberately do not compile
+    /// them a second time here.
+    pub(crate) fn finalize_responses_continuation_body(
+        &self,
+        body: Value,
+        options: &CodexRequestOptions,
+    ) -> Value {
+        apply_responses_history_replay(self.apply_body_policy(body), options.history_replay)
+    }
+
     pub(crate) fn finalize_body(
         &self,
         transport: CodexRequestTransport,
@@ -237,13 +250,7 @@ impl CodexThirdPartyRequestPolicy {
     ) -> Result<Value, ProxyError> {
         let mut body = self.apply_body_policy(body);
         if transport == CodexRequestTransport::Responses {
-            body = match options.history_replay.unwrap_or(HistoryReplay::NativeOnly) {
-                HistoryReplay::ResponsesReasoningTextContent => {
-                    super::openai_compat::normalize_third_party_responses_reasoning_items(body)
-                }
-                HistoryReplay::Omit => omit_responses_reasoning_items(body),
-                HistoryReplay::NativeOnly | HistoryReplay::ChatReasoningContent => body,
-            };
+            body = apply_responses_history_replay(body, options.history_replay);
         }
         super::codex_tool_schema::compile_tool_schemas(
             &mut body,
@@ -361,6 +368,19 @@ impl CodexThirdPartyRequestPolicy {
             super::codex_responses_tool_history::consolidate_namespaces(&mut logical_body);
         }
         Ok(logical_body)
+    }
+}
+
+fn apply_responses_history_replay(
+    body: Value,
+    history_replay: Option<HistoryReplay>,
+) -> Value {
+    match history_replay.unwrap_or(HistoryReplay::NativeOnly) {
+        HistoryReplay::ResponsesReasoningTextContent => {
+            super::openai_compat::normalize_third_party_responses_reasoning_items(body)
+        }
+        HistoryReplay::Omit => omit_responses_reasoning_items(body),
+        HistoryReplay::NativeOnly | HistoryReplay::ChatReasoningContent => body,
     }
 }
 
