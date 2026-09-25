@@ -2822,13 +2822,12 @@ impl RequestForwarder {
                 client_requested_streaming,
                 &codex_router_provider.settings_config,
             );
-        let native_responses_hosted_projection_eligible =
-            matches!(app_type, AppType::Codex)
-                && !codex_responses_to_chat
-                && !codex_responses_to_messages
-                && !codex_responses_to_anthropic
-                && codex_third_party_request_policy.is_some()
-                && !super::providers::provider_needs_responses_namespace_flatten(provider);
+        let native_responses_hosted_projection_eligible = matches!(app_type, AppType::Codex)
+            && !codex_responses_to_chat
+            && !codex_responses_to_messages
+            && !codex_responses_to_anthropic
+            && codex_third_party_request_policy.is_some()
+            && !super::providers::provider_needs_responses_namespace_flatten(provider);
         let native_responses_hosted_loop_allowed = native_responses_hosted_projection_eligible
             && should_enable_hosted_tool_loop(
                 &mapped_body,
