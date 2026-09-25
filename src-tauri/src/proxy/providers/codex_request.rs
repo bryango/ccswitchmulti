@@ -371,10 +371,7 @@ impl CodexThirdPartyRequestPolicy {
     }
 }
 
-fn apply_responses_history_replay(
-    body: Value,
-    history_replay: Option<HistoryReplay>,
-) -> Value {
+fn apply_responses_history_replay(body: Value, history_replay: Option<HistoryReplay>) -> Value {
     match history_replay.unwrap_or(HistoryReplay::NativeOnly) {
         HistoryReplay::ResponsesReasoningTextContent => {
             super::openai_compat::normalize_third_party_responses_reasoning_items(body)
