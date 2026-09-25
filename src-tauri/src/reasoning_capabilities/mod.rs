@@ -782,7 +782,9 @@ mod tests {
         assert_eq!(resolved.source, CapabilitySource::Unknown);
         assert!(!resolved.fingerprint.is_empty());
 
-        let capability = resolved.capability.expect("third-party fallback capability");
+        let capability = resolved
+            .capability
+            .expect("third-party fallback capability");
         assert_eq!(capability.supported_efforts, vec!["low", "high", "max"]);
         assert_eq!(capability.default_effort.as_deref(), Some("high"));
         assert_eq!(capability.source.as_deref(), Some("fallback"));
