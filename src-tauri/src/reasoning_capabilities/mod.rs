@@ -10,10 +10,12 @@
 //! 3. CCSM 维护的版本化能力库（随应用打包的独立 JSON 资源）；
 //! 4. 内置清单（deepseek-v4 / k3）；
 //! 5. Codex 官方模型缓存（仅未知平台生效；OpenRouter/vLLM 等聚合平台不套用）；
-//! 6. Unknown（fail-closed）。
+//! 6. Unknown。第三方 Provider 在所有权威来源都缺失时使用 low/high/max 的推断兜底；
+//!    canonical OpenAI Provider 仍保持 unknown。
 //!
 //! 核心原则：缺失证据不是不存在的证据。`NotAdvertised`/`Unavailable`/`Invalid`
-//! 以及库/内置未命中，都只能得到 `unknown`，绝不自动生成 `confirmed_unsupported`。
+//! 以及库/内置未命中都不会生成 `confirmed_unsupported`。第三方兜底会明确保留
+//! `CapabilitySource::Unknown` + inferred confidence，不能伪装成探测或权威声明。
 
 pub mod catalog;
 pub mod provider_metadata;
@@ -49,7 +51,8 @@ pub enum CapabilitySource {
     Builtin,
     /// Codex 官方模型缓存（仅未知平台生效；OpenRouter/vLLM 等聚合平台不套用）。
     Official,
-    /// 无来源命中，fail-closed unknown。
+    /// 无权威来源命中。第三方 Provider 可附带 inferred low/high/max 兜底；
+    /// canonical OpenAI Provider 仍保持无 capability。
     Unknown,
 }
 
@@ -200,14 +203,15 @@ pub fn resolve_codex_model_capability(
 ) -> ResolvedModelCapability {
     let platform = provider_metadata::detect_platform(provider);
     let official_models = crate::codex_config::codex_official_models_cache().unwrap_or_default();
-    resolve_codex_model_capability_core(
+    let resolved = resolve_codex_model_capability_core(
         &provider.settings_config,
         platform,
         model,
         detection,
         catalog::global_library().as_ref(),
         &official_models,
-    )
+    );
+    apply_unknown_third_party_reasoning_fallback(provider, model, resolved)
 }
 
 /// 测试用 resolver 入口（可注入能力库；不加载 official 缓存，保持确定性）。
@@ -220,14 +224,15 @@ pub fn resolve_codex_model_capability_with_library(
     library: Option<&catalog::CapabilityLibrary>,
 ) -> ResolvedModelCapability {
     let platform = provider_metadata::detect_platform(provider);
-    resolve_codex_model_capability_core(
+    let resolved = resolve_codex_model_capability_core(
         &provider.settings_config,
         platform,
         model,
         detection,
         library,
         &[],
-    )
+    );
+    apply_unknown_third_party_reasoning_fallback(provider, model, resolved)
 }
 
 /// Apply the model's product-level Ultra setting after the capability source
@@ -317,6 +322,59 @@ fn resolved_with_catalog_ultra_setting(
         capability: Some(capability),
         source,
     }
+}
+
+pub(crate) fn unknown_third_party_reasoning_fallback_capability() -> CodexModelReasoningCapability {
+    CodexModelReasoningCapability {
+        schema_version: Some(2),
+        support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
+        control_kind: Some(ReasoningControlKind::Graded),
+        supported: None,
+        supported_efforts: vec!["low".into(), "high".into(), "max".into()],
+        default_effort: Some("high".into()),
+        disable_allowed: true,
+        upstream: CodexModelReasoningUpstream {
+            format: "string".into(),
+            parameter: "reasoning_effort".into(),
+            effort_map: [
+                ("low".into(), "low".into()),
+                ("medium".into(), "high".into()),
+                ("high".into(), "high".into()),
+                ("xhigh".into(), "high".into()),
+                ("max".into(), "max".into()),
+            ]
+            .into_iter()
+            .collect(),
+        },
+        output_format: None,
+        source: Some("fallback".into()),
+        confidence: Some(CapabilityConfidence::Inferred),
+        fetched_at: None,
+        provider_key: None,
+        model_revision: None,
+        codex_ultra_orchestration: None,
+    }
+}
+
+fn apply_unknown_third_party_reasoning_fallback(
+    provider: &Provider,
+    model: &str,
+    resolved: ResolvedModelCapability,
+) -> ResolvedModelCapability {
+    if resolved.source != CapabilitySource::Unknown
+        || resolved.capability.is_some()
+        || (provider.category.as_deref() == Some("official")
+            && provider.id == crate::database::CODEX_OFFICIAL_PROVIDER_ID)
+    {
+        return resolved;
+    }
+
+    resolved_with_catalog_ultra_setting(
+        &provider.settings_config,
+        model,
+        CapabilitySource::Unknown,
+        unknown_third_party_reasoning_fallback_capability(),
+    )
 }
 
 /// Resolver 核心（settings-based、纯函数、无网络、无全局状态）。
@@ -717,10 +775,32 @@ mod tests {
     }
 
     #[test]
-    fn unknown_when_no_source_hits() {
+    fn unknown_third_party_falls_back_to_common_efforts() {
         let provider = plain_provider("Some Gateway", "https://example.com/v1");
         let resolved =
             resolve_codex_model_capability_with_library(&provider, "mystery-model-xyz", None, None);
+        assert_eq!(resolved.source, CapabilitySource::Unknown);
+        assert!(!resolved.fingerprint.is_empty());
+
+        let capability = resolved
+            .capability
+            .expect("third-party fallback capability");
+        assert_eq!(capability.supported_efforts, vec!["low", "high", "max"]);
+        assert_eq!(capability.default_effort.as_deref(), Some("high"));
+        assert_eq!(capability.source.as_deref(), Some("fallback"));
+        assert_eq!(capability.confidence, Some(CapabilityConfidence::Inferred));
+        assert_eq!(capability.upstream.format, "string");
+        assert_eq!(capability.upstream.parameter, "reasoning_effort");
+    }
+
+    #[test]
+    fn canonical_official_provider_keeps_unknown_without_metadata() {
+        let mut provider = plain_provider("OpenAI", "https://chatgpt.com/backend-api/codex");
+        provider.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        provider.category = Some("official".to_string());
+
+        let resolved =
+            resolve_codex_model_capability_with_library(&provider, "future-gpt-model", None, None);
         assert_eq!(resolved.source, CapabilitySource::Unknown);
         assert!(resolved.capability.is_none());
         assert_eq!(resolved.fingerprint, "");

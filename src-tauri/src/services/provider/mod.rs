@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn add_rejects_unknown_reasoning_before_provider_persistence() {
+    fn add_unknown_third_party_reasoning_reaches_probe_gate() {
         with_test_home(|state, _| {
             let provider = Provider::with_id(
                 "codex-unknown-reasoning-add".to_string(),
@@ -1315,12 +1315,15 @@ mod tests {
                 None,
             );
 
-            let result = ProviderService::add(state, AppType::Codex, provider, false);
+            let error = ProviderService::add(state, AppType::Codex, provider, false)
+                .expect_err("provider add still requires provider-set probe evidence");
 
-            assert!(result
-                .expect_err("provider add must reject incomplete subagent capability")
-                .to_string()
-                .contains("unknown_reasoning_capability_requires_declaration"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("codex_provider_set_probe_required"),
+                "unknown reasoning should no longer be the blocking gate: {error}"
+            );
             assert!(state
                 .db
                 .get_provider_by_id("codex-unknown-reasoning-add", AppType::Codex.as_str())
@@ -1331,7 +1334,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn update_rejects_unknown_reasoning_before_provider_persistence() {
+    fn update_unknown_third_party_reasoning_reaches_probe_gate() {
         with_test_home(|state, _| {
             let provider = Provider::with_id(
                 "codex-unknown-reasoning-update".to_string(),
@@ -1347,12 +1350,16 @@ mod tests {
             let mut updated = provider.clone();
             updated.settings_config =
                 codex_settings_with_unknown_subagent("https://api.example.com/v1", "sk-new");
-            let result = ProviderService::update(state, AppType::Codex, None, updated);
 
-            assert!(result
-                .expect_err("provider update must reject incomplete subagent capability")
-                .to_string()
-                .contains("unknown_reasoning_capability_requires_declaration"));
+            let error = ProviderService::update(state, AppType::Codex, None, updated)
+                .expect_err("provider update still requires provider-set probe evidence");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("codex_provider_set_probe_required"),
+                "unknown reasoning should no longer be the blocking gate: {error}"
+            );
             let saved = state
                 .db
                 .get_provider_by_id("codex-unknown-reasoning-update", AppType::Codex.as_str())

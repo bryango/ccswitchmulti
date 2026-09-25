@@ -3907,17 +3907,23 @@ fn compile_configured_codex_subagent_roles(
                     route_classifications.insert(role_identity.to_string(), classification);
                 }
             }
+            let provider_kind = classification
+                .as_ref()
+                .map(|value| value.provider_kind)
+                .unwrap_or(SubagentProviderKind::ThirdParty);
+            let fallback_reasoning = (provider_kind == SubagentProviderKind::ThirdParty
+                && spec.reasoning.is_none())
+            .then(crate::reasoning_capabilities::unknown_third_party_reasoning_fallback_capability);
+            let reasoning = spec.reasoning.as_ref().or(fallback_reasoning.as_ref());
+
             SubagentCatalogModel {
                 model: spec.model.clone(),
-                provider_kind: classification
-                    .as_ref()
-                    .map(|value| value.provider_kind)
-                    .unwrap_or(SubagentProviderKind::ThirdParty),
+                provider_kind,
                 routable: classification.is_some(),
                 context_window: spec.context_window,
                 reasoning:
                     crate::proxy::providers::codex_reasoning::resolve_subagent_reasoning_capability(
-                        spec.reasoning.as_ref(),
+                        reasoning,
                     ),
             }
         })
@@ -8852,7 +8858,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn codex_subagent_v2_save_rejects_unknown_reasoning_for_enabled_routable_profile() {
+    fn codex_subagent_v2_save_uses_common_reasoning_fallback_for_unknown_third_party() {
         let settings = codex_subagent_profile_status_settings(
             "v2",
             json!({ "private-model": codex_subagent_profile_status_profile("private-model", true) }),
@@ -8864,8 +8870,25 @@ wire_api = "responses"
             }]),
         );
 
+        validate_codex_subagent_v2_candidate(&settings, None, true)
+            .expect("unknown third-party reasoning should use the low/high/max fallback");
+    }
+
+    #[test]
+    fn codex_subagent_v2_save_still_rejects_unknown_reasoning_for_official_route() {
+        let settings = codex_subagent_profile_status_settings(
+            "v2",
+            json!({ "future-official-model": codex_subagent_profile_status_profile("future-official-model", true) }),
+            json!([{ "model": "future-official-model", "contextWindow": 128000 }]),
+            json!([{
+                "id": "official-route",
+                "match": { "models": ["future-official-model"] },
+                "upstream": { "auth": { "source": "native_codex_auth" } }
+            }]),
+        );
+
         let error = validate_codex_subagent_v2_candidate(&settings, None, true)
-            .expect_err("unknown reasoning capability must block provider save");
+            .expect_err("unknown official reasoning capability must remain fail-closed");
         assert!(error
             .to_string()
             .contains("unknown_reasoning_capability_requires_declaration"));
