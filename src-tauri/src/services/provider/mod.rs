@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn add_rejects_unknown_reasoning_before_provider_persistence() {
+    fn add_allows_unknown_third_party_reasoning_with_fallback() {
         with_test_home(|state, _| {
             let provider = Provider::with_id(
                 "codex-unknown-reasoning-add".to_string(),
@@ -1314,24 +1314,23 @@ mod tests {
                 codex_settings_with_unknown_subagent("https://api.example.com/v1", "sk-test"),
                 None,
             );
+            let expected_settings = provider.settings_config.clone();
 
-            let result = ProviderService::add(state, AppType::Codex, provider, false);
+            ProviderService::add(state, AppType::Codex, provider, false)
+                .expect("provider add should accept inferred third-party reasoning");
 
-            assert!(result
-                .expect_err("provider add must reject incomplete subagent capability")
-                .to_string()
-                .contains("unknown_reasoning_capability_requires_declaration"));
-            assert!(state
+            let saved = state
                 .db
                 .get_provider_by_id("codex-unknown-reasoning-add", AppType::Codex.as_str())
-                .expect("query rejected provider")
-                .is_none());
+                .expect("query added provider")
+                .expect("provider must be persisted");
+            assert_eq!(saved.settings_config, expected_settings);
         });
     }
 
     #[test]
     #[serial]
-    fn update_rejects_unknown_reasoning_before_provider_persistence() {
+    fn update_allows_unknown_third_party_reasoning_with_fallback() {
         with_test_home(|state, _| {
             let provider = Provider::with_id(
                 "codex-unknown-reasoning-update".to_string(),
@@ -1347,18 +1346,17 @@ mod tests {
             let mut updated = provider.clone();
             updated.settings_config =
                 codex_settings_with_unknown_subagent("https://api.example.com/v1", "sk-new");
-            let result = ProviderService::update(state, AppType::Codex, None, updated);
+            let expected_settings = updated.settings_config.clone();
 
-            assert!(result
-                .expect_err("provider update must reject incomplete subagent capability")
-                .to_string()
-                .contains("unknown_reasoning_capability_requires_declaration"));
+            ProviderService::update(state, AppType::Codex, None, updated)
+                .expect("provider update should accept inferred third-party reasoning");
+
             let saved = state
                 .db
                 .get_provider_by_id("codex-unknown-reasoning-update", AppType::Codex.as_str())
-                .expect("query provider after rejected update")
-                .expect("seed provider remains persisted");
-            assert_eq!(saved.settings_config, provider.settings_config);
+                .expect("query provider after update")
+                .expect("updated provider remains persisted");
+            assert_eq!(saved.settings_config, expected_settings);
         });
     }
 
