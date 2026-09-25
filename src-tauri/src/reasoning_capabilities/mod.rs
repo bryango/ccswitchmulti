@@ -324,7 +324,7 @@ fn resolved_with_catalog_ultra_setting(
     }
 }
 
-fn unknown_third_party_reasoning_fallback_capability() -> CodexModelReasoningCapability {
+pub(crate) fn unknown_third_party_reasoning_fallback_capability() -> CodexModelReasoningCapability {
     CodexModelReasoningCapability {
         schema_version: Some(2),
         support_status: Some(ReasoningSupportStatus::ConfirmedSupported),
