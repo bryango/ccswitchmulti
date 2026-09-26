@@ -12777,14 +12777,14 @@ mod tests {
             &Err("test no credentials".to_string()),
             move |body| {
                 let hosted_response = hosted_response_for_closure.clone();
-                let hosted_enabled = body
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .is_some_and(|tools| {
-                        tools.iter().any(|tool| {
-                            tool.get("name").and_then(Value::as_str) == Some("web_search")
-                        })
-                    });
+                let hosted_enabled =
+                    body.get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tools| {
+                            tools.iter().any(|tool| {
+                                tool.get("name").and_then(Value::as_str) == Some("web_search")
+                            })
+                        });
                 async move {
                     if hosted_enabled {
                         Ok(ProxyResponse::buffered(
@@ -12853,14 +12853,14 @@ mod tests {
             &Err("test no credentials".to_string()),
             move |body| {
                 let hosted_response = hosted_response_for_closure.clone();
-                let hosted_enabled = body
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .is_some_and(|tools| {
-                        tools.iter().any(|tool| {
-                            tool.get("name").and_then(Value::as_str) == Some("web_search")
-                        })
-                    });
+                let hosted_enabled =
+                    body.get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tools| {
+                            tools.iter().any(|tool| {
+                                tool.get("name").and_then(Value::as_str) == Some("web_search")
+                            })
+                        });
                 async move {
                     let body = if hosted_enabled {
                         Bytes::from(hosted_response.as_str().to_string())
