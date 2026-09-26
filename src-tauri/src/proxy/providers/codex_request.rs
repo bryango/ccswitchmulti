@@ -229,6 +229,24 @@ impl CodexThirdPartyRequestPolicy {
         apply_provider_body_policy(&self.provider, body)
     }
 
+    /// Re-apply the provider-owned parts of Responses finalization after a local
+    /// hosted-tool continuation mutates `input`.
+    ///
+    /// Tool schemas are unchanged between rounds, so deliberately do not compile
+    /// them a second time here.
+    pub(crate) fn finalize_responses_continuation_body(
+        &self,
+        body: Value,
+        options: &CodexRequestOptions,
+    ) -> Value {
+        // The first upstream request already applied provider body overrides.
+        // Re-merging them here can replace `input` / `tools` arrays wholesale
+        // and erase the hosted tool result that was just appended. Only sanitize
+        // newly replayed upstream items and re-apply the negotiated history policy.
+        let body = canonicalize_value(filter_private_params_with_whitelist(body, &[]));
+        apply_responses_history_replay(body, options.history_replay)
+    }
+
     pub(crate) fn finalize_body(
         &self,
         transport: CodexRequestTransport,
@@ -237,13 +255,7 @@ impl CodexThirdPartyRequestPolicy {
     ) -> Result<Value, ProxyError> {
         let mut body = self.apply_body_policy(body);
         if transport == CodexRequestTransport::Responses {
-            body = match options.history_replay.unwrap_or(HistoryReplay::NativeOnly) {
-                HistoryReplay::ResponsesReasoningTextContent => {
-                    super::openai_compat::normalize_third_party_responses_reasoning_items(body)
-                }
-                HistoryReplay::Omit => omit_responses_reasoning_items(body),
-                HistoryReplay::NativeOnly | HistoryReplay::ChatReasoningContent => body,
-            };
+            body = apply_responses_history_replay(body, options.history_replay);
         }
         super::codex_tool_schema::compile_tool_schemas(
             &mut body,
@@ -361,6 +373,16 @@ impl CodexThirdPartyRequestPolicy {
             super::codex_responses_tool_history::consolidate_namespaces(&mut logical_body);
         }
         Ok(logical_body)
+    }
+}
+
+fn apply_responses_history_replay(body: Value, history_replay: Option<HistoryReplay>) -> Value {
+    match history_replay.unwrap_or(HistoryReplay::NativeOnly) {
+        HistoryReplay::ResponsesReasoningTextContent => {
+            super::openai_compat::normalize_third_party_responses_reasoning_items(body)
+        }
+        HistoryReplay::Omit => omit_responses_reasoning_items(body),
+        HistoryReplay::NativeOnly | HistoryReplay::ChatReasoningContent => body,
     }
 }
 
@@ -617,4 +639,53 @@ fn redacted_url(raw: &str) -> String {
 
 fn sha256_hex(value: &[u8]) -> String {
     hex::encode(Sha256::digest(value))
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn continuation_finalization_does_not_reapply_provider_body_override() {
+        let mut provider = Provider::with_id(
+            "test-provider".to_string(),
+            "Test Provider".to_string(),
+            json!({}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            local_proxy_request_overrides: Some(LocalProxyRequestOverrides {
+                body: Some(json!({
+                    "input": [{"role":"user","content":"override"}],
+                    "tool_choice": "required"
+                })),
+                ..LocalProxyRequestOverrides::default()
+            }),
+            ..ProviderMeta::default()
+        });
+        let policy = CodexThirdPartyRequestPolicy {
+            provider,
+            base_url: "https://example.com/v1".to_string(),
+            auth_headers: HeaderMap::new(),
+            authentication_kind: "bearer".to_string(),
+            credential_fingerprint: "test".to_string(),
+            fingerprint: "test".to_string(),
+            is_full_url: false,
+        };
+        let body = json!({
+            "input": [
+                {"role":"user","content":"original"},
+                {"type":"function_call","call_id":"call_search","name":"web_search","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_search","output":"result"}
+            ],
+            "tool_choice": "auto"
+        });
+
+        let finalized = policy
+            .finalize_responses_continuation_body(body.clone(), &CodexRequestOptions::default());
+
+        assert_eq!(finalized["input"], body["input"]);
+        assert_eq!(finalized["tool_choice"], "auto");
+    }
 }
