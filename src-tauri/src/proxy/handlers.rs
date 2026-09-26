@@ -3182,17 +3182,34 @@ async fn handle_responses_for_app(
         .await;
     }
 
-    if native_hosted_tool_loop_response && response.status().is_success() {
+    if native_hosted_tool_loop_response
+        && response.status().is_success()
+        && !is_codex_v2_compaction
+    {
         let (mut response_headers, status, body_bytes) =
             read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
         response_headers.remove(HOSTED_TOOL_LOOP_HEADER);
         strip_entity_headers_for_rebuilt_body(&mut response_headers);
 
-        let mut value: Value = serde_json::from_slice(&body_bytes).map_err(|error| {
-            ProxyError::TransformError(format!(
-                "Failed to parse native Responses hosted-tool result: {error}"
-            ))
-        })?;
+        let mut value: Value = match serde_json::from_slice(&body_bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                let response = super::hyper_client::ProxyResponse::buffered(
+                    status,
+                    response_headers,
+                    body_bytes,
+                );
+                return process_response_with_stream_hint(
+                    response,
+                    &ctx,
+                    &state,
+                    &CODEX_PARSER_CONFIG,
+                    connection_guard,
+                    is_stream,
+                )
+                .await;
+            }
+        };
         if desktop_reasoning_mapping {
             map_completed_response_for_desktop(&mut value);
         }

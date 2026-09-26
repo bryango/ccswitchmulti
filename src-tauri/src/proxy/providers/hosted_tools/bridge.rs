@@ -12,6 +12,10 @@ use super::{
         HostedWebSearchConfig, WEB_SEARCH_FUNCTION_NAME,
     },
 };
+use crate::proxy::{
+    json_canonical::{canonical_json_string, short_sha256_hex},
+    providers::transform_codex_chat::response_message_item_id,
+};
 use serde_json::{json, Value};
 
 pub(crate) const HOSTED_TOOL_LOOP_HEADER: &str = "x-cc-switch-hosted-tool-loop";
@@ -383,7 +387,19 @@ pub(crate) fn ensure_responses_client_output(response: &mut Value, fallback_text
         return;
     }
 
+    let fallback_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(response_message_item_id)
+        .unwrap_or_else(|| {
+            format!(
+                "msg_ccswitch_{}",
+                short_sha256_hex(canonical_json_string(response).as_bytes())
+            )
+        });
     let fallback = json!({
+        "id": fallback_id,
         "type": "message",
         "role": "assistant",
         "status": "completed",
@@ -1182,6 +1198,7 @@ mod tests {
             image_generation: None,
         };
         let mut response = json!({
+            "id":"resp_recovery",
             "output": [{
                 "type":"function_call",
                 "call_id":"search",
@@ -1194,6 +1211,7 @@ mod tests {
         ensure_responses_client_output(&mut response, "Search could not be completed.");
 
         assert_eq!(response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(response["output"][0]["id"], "msg_recovery");
         assert_eq!(response["output"][0]["type"], "message");
         assert_eq!(
             response["output"][0]["content"][0]["text"],

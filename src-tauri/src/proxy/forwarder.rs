@@ -2825,6 +2825,8 @@ impl RequestForwarder {
                 client_requested_streaming,
                 &codex_router_provider.settings_config,
             );
+        let native_responses_v2_compaction =
+            codex_request_is_v2_compaction(app_type, endpoint, &mapped_body, headers);
         let native_responses_hosted_projection_eligible = matches!(app_type, AppType::Codex)
             && !codex_responses_to_chat
             && !codex_responses_to_messages
@@ -2832,6 +2834,7 @@ impl RequestForwarder {
             && codex_third_party_request_policy.is_some()
             && !super::providers::provider_needs_responses_namespace_flatten(provider);
         let native_responses_hosted_loop_allowed = native_responses_hosted_projection_eligible
+            && !native_responses_v2_compaction
             && should_enable_hosted_tool_loop(
                 &mapped_body,
                 client_requested_streaming,
@@ -7118,9 +7121,6 @@ where
             let recovery = send_responses_request(responses_request).await?;
             let (recovery_status, mut recovery_headers, recovery_body) =
                 read_decoded_proxy_response_with_timeout(recovery, response_body_timeout).await?;
-            if force_response_header || loop_executed {
-                mark_hosted_tool_loop_response(&mut recovery_headers);
-            }
             if !recovery_status.is_success() {
                 return Ok(ProxyResponse::buffered(
                     recovery_status,
@@ -7138,6 +7138,9 @@ where
                     ));
                 }
             };
+            if force_response_header || loop_executed {
+                mark_hosted_tool_loop_response(&mut recovery_headers);
+            }
             remove_projected_hosted_function_calls_from_responses_response(
                 &mut recovery_value,
                 config,
@@ -12735,6 +12738,155 @@ mod tests {
             .expect("read cap recovery");
         let value: Value = serde_json::from_slice(&body).expect("cap recovery JSON");
         assert_eq!(value["output"][0]["type"], "message");
+    }
+
+    #[tokio::test]
+    async fn native_responses_hosted_recovery_error_does_not_leak_marker() {
+        use crate::proxy::providers::hosted_tools::web_search::HostedWebSearchConfig;
+
+        let hosted_response = json!({
+            "output": [{
+                "type":"function_call",
+                "call_id":"call_search",
+                "name":"web_search",
+                "arguments":"{\"query\":\"\"}"
+            }]
+        })
+        .to_string();
+        let initial_response = ProxyResponse::buffered(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from(hosted_response.clone()),
+        );
+        let mut request = json!({
+            "input":[],
+            "tools":[crate::proxy::providers::hosted_tools::web_search::responses_tool_definition()],
+            "tool_choice":{"type":"function","name":"web_search"},
+            "stream":false
+        });
+        let hosted_response = Arc::new(hosted_response);
+        let hosted_response_for_closure = hosted_response.clone();
+
+        let response = run_hosted_tool_responses_loop(
+            initial_response,
+            &mut request,
+            &HostedToolLoopConfig {
+                web_search: Some(HostedWebSearchConfig::default()),
+                image_generation: None,
+            },
+            &Err("test no credentials".to_string()),
+            move |body| {
+                let hosted_response = hosted_response_for_closure.clone();
+                let hosted_enabled = body
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| {
+                        tools.iter().any(|tool| {
+                            tool.get("name").and_then(Value::as_str) == Some("web_search")
+                        })
+                    });
+                async move {
+                    if hosted_enabled {
+                        Ok(ProxyResponse::buffered(
+                            StatusCode::OK,
+                            HeaderMap::new(),
+                            Bytes::from(hosted_response.as_str().to_string()),
+                        ))
+                    } else {
+                        Ok(ProxyResponse::buffered(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            HeaderMap::new(),
+                            Bytes::from_static(b"rate limited"),
+                        ))
+                    }
+                }
+            },
+            None,
+            true,
+            Some("web_search"),
+            "session",
+            "deepseek-flash",
+            "provider",
+            Duration::ZERO,
+        )
+        .await
+        .expect("recovery error should pass through");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(HOSTED_TOOL_LOOP_HEADER));
+    }
+
+    #[tokio::test]
+    async fn native_responses_hosted_recovery_non_json_does_not_mark_response() {
+        use crate::proxy::providers::hosted_tools::web_search::HostedWebSearchConfig;
+
+        let hosted_response = json!({
+            "output": [{
+                "type":"function_call",
+                "call_id":"call_search",
+                "name":"web_search",
+                "arguments":"{\"query\":\"\"}"
+            }]
+        })
+        .to_string();
+        let initial_response = ProxyResponse::buffered(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from(hosted_response.clone()),
+        );
+        let mut request = json!({
+            "input":[],
+            "tools":[crate::proxy::providers::hosted_tools::web_search::responses_tool_definition()],
+            "tool_choice":{"type":"function","name":"web_search"},
+            "stream":false
+        });
+        let hosted_response = Arc::new(hosted_response);
+        let hosted_response_for_closure = hosted_response.clone();
+
+        let response = run_hosted_tool_responses_loop(
+            initial_response,
+            &mut request,
+            &HostedToolLoopConfig {
+                web_search: Some(HostedWebSearchConfig::default()),
+                image_generation: None,
+            },
+            &Err("test no credentials".to_string()),
+            move |body| {
+                let hosted_response = hosted_response_for_closure.clone();
+                let hosted_enabled = body
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| {
+                        tools.iter().any(|tool| {
+                            tool.get("name").and_then(Value::as_str) == Some("web_search")
+                        })
+                    });
+                async move {
+                    let body = if hosted_enabled {
+                        Bytes::from(hosted_response.as_str().to_string())
+                    } else {
+                        Bytes::from_static(b"event: response.completed\ndata: {}\n\n")
+                    };
+                    Ok(ProxyResponse::buffered(
+                        StatusCode::OK,
+                        HeaderMap::new(),
+                        body,
+                    ))
+                }
+            },
+            None,
+            true,
+            Some("web_search"),
+            "session",
+            "deepseek-flash",
+            "provider",
+            Duration::ZERO,
+        )
+        .await
+        .expect("non-json recovery should pass through");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(HOSTED_TOOL_LOOP_HEADER));
     }
 
     /// 验证 hosted web_search loop 会消费第一轮工具调用、回灌 tool output 并返回最终 Chat 响应。
