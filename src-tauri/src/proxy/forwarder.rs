@@ -3203,8 +3203,12 @@ impl RequestForwarder {
             &filtered_body,
             self.session_client_provided,
         );
-        let request_is_streaming = !native_hosted_tools_forced_non_stream
-            && is_streaming_request(&effective_endpoint, &filtered_body, headers);
+        let request_is_streaming = upstream_request_is_streaming(
+            &effective_endpoint,
+            &filtered_body,
+            headers,
+            native_hosted_tools_forced_non_stream,
+        );
         let force_identity_encoding = needs_transform
             || codex_responses_to_chat
             || codex_responses_to_messages
@@ -8000,6 +8004,15 @@ fn is_chatgpt_codex_responses_upstream_url(url: &str) -> bool {
     )
 }
 
+fn upstream_request_is_streaming(
+    endpoint: &str,
+    body: &Value,
+    headers: &axum::http::HeaderMap,
+    forced_non_stream: bool,
+) -> bool {
+    !forced_non_stream && is_streaming_request(endpoint, body, headers)
+}
+
 fn is_streaming_request(endpoint: &str, body: &Value, headers: &axum::http::HeaderMap) -> bool {
     if body
         .get("stream")
@@ -12650,6 +12663,7 @@ mod tests {
         );
         let mut request = json!({
             "input":[],
+            "tools":[crate::proxy::providers::hosted_tools::web_search::responses_tool_definition()],
             "tool_choice":{"type":"function","name":"web_search"},
             "stream":false
         });
@@ -13721,7 +13735,18 @@ mod tests {
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         let body = json!({"stream": false});
 
-        assert!(!(!true && is_streaming_request("/v1/responses", &body, &headers)));
+        assert!(!upstream_request_is_streaming(
+            "/v1/responses",
+            &body,
+            &headers,
+            true,
+        ));
+        assert!(upstream_request_is_streaming(
+            "/v1/responses",
+            &body,
+            &headers,
+            false,
+        ));
     }
 
     #[test]
