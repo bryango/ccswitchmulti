@@ -8,8 +8,7 @@ use super::providers::{
         append_tool_outputs_to_chat_request, append_tool_outputs_to_responses_request,
         disable_projected_hosted_functions_for_responses_request, execute_hosted_tool_calls,
         hosted_tool_error_messages, normalize_responses_input_for_hosted_continuation,
-        project_hosted_tools_for_responses_request,
-        relax_hosted_tool_choice_for_responses_request,
+        project_hosted_tools_for_responses_request, relax_hosted_tool_choice_for_responses_request,
         remove_projected_hosted_function_calls_from_responses_response, scan_hosted_tool_calls,
         scan_responses_hosted_tool_calls, HostedToolCall, HostedToolCallKind, HostedToolCallScan,
         HostedToolLoopConfig, ResponsesHostedToolCallScan, HOSTED_TOOL_LOOP_HEADER,
@@ -12680,14 +12679,14 @@ mod tests {
             &Err("test no credentials".to_string()),
             move |body| {
                 let hosted_response = hosted_response_for_closure.clone();
-                let hosted_enabled = body
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .is_some_and(|tools| {
-                        tools.iter().any(|tool| {
-                            tool.get("name").and_then(Value::as_str) == Some("web_search")
-                        })
-                    });
+                let hosted_enabled =
+                    body.get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tools| {
+                            tools.iter().any(|tool| {
+                                tool.get("name").and_then(Value::as_str) == Some("web_search")
+                            })
+                        });
                 async move {
                     let body = if hosted_enabled {
                         hosted_response.as_str().to_string()
