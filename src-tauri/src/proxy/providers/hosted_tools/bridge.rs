@@ -205,9 +205,9 @@ pub(crate) fn relax_hosted_tool_choice_for_responses_request(
                         .get("tools")
                         .and_then(Value::as_array)
                         .is_some_and(|tools| {
-                            tools.iter().any(|tool| {
-                                responses_tool_selector_is_enabled_hosted(tool, config)
-                            })
+                            tools
+                                .iter()
+                                .any(|tool| responses_tool_selector_is_enabled_hosted(tool, config))
                         })
             }
             _ => false,
@@ -233,10 +233,7 @@ fn hosted_function_is_enabled(name: &str, config: &HostedToolLoopConfig) -> bool
     }
 }
 
-fn responses_tool_selector_is_enabled_hosted(
-    tool: &Value,
-    config: &HostedToolLoopConfig,
-) -> bool {
+fn responses_tool_selector_is_enabled_hosted(tool: &Value, config: &HostedToolLoopConfig) -> bool {
     match tool.get("type").and_then(Value::as_str) {
         Some("function") => tool
             .get("name")
@@ -996,7 +993,9 @@ mod tests {
             })],
         ));
 
-        let input = request["input"].as_array().expect("normalized Responses input");
+        let input = request["input"]
+            .as_array()
+            .expect("normalized Responses input");
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[0]["content"][0]["text"], "hello");
