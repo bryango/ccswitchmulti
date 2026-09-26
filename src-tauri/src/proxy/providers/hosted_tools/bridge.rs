@@ -370,7 +370,7 @@ pub(crate) fn disable_projected_hosted_functions_for_responses_request(
     request: &mut Value,
     config: &HostedToolLoopConfig,
 ) {
-    if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
+    let remove_tools = if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
         tools.retain(|tool| {
             if tool.get("type").and_then(Value::as_str) != Some("function") {
                 return true;
@@ -380,9 +380,12 @@ pub(crate) fn disable_projected_hosted_functions_for_responses_request(
             };
             !hosted_function_is_enabled(name, config)
         });
-        if tools.is_empty() {
-            request.as_object_mut().unwrap().remove("tools");
-        }
+        tools.is_empty()
+    } else {
+        false
+    };
+    if remove_tools {
+        request.as_object_mut().unwrap().remove("tools");
     }
     request["tool_choice"] = json!("auto");
 }
@@ -396,7 +399,7 @@ pub(crate) fn hosted_tool_error_messages(
         .map(|call| {
             json!({
                 "role": "tool",
-                "tool_call_id": call.id,
+                "tool_call_id": call.id.clone(),
                 "content": json!({"error": message}).to_string()
             })
         })
