@@ -188,22 +188,63 @@ pub(crate) fn relax_hosted_tool_choice_for_responses_request(
     request: &mut Value,
     config: &HostedToolLoopConfig,
 ) {
-    let Some(choice) = request.get("tool_choice") else {
+    let Some(choice) = request.get("tool_choice").cloned() else {
         return;
     };
-    if choice.get("type").and_then(Value::as_str) != Some("function") {
+
+    let should_relax = match &choice {
+        Value::String(value) => value == "required",
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("function") => object
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| hosted_function_is_enabled(name, config)),
+            Some("allowed_tools") => {
+                object.get("mode").and_then(Value::as_str) == Some("required")
+                    && object
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tools| {
+                            tools.iter().any(|tool| {
+                                responses_tool_selector_is_enabled_hosted(tool, config)
+                            })
+                        })
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !should_relax {
         return;
     }
-    let Some(name) = choice.get("name").and_then(Value::as_str) else {
-        return;
-    };
-    let enabled_hosted_tool = match HostedToolCallKind::from_function_name(name) {
+
+    if choice.get("type").and_then(Value::as_str) == Some("allowed_tools") {
+        request["tool_choice"]["mode"] = json!("auto");
+    } else {
+        request["tool_choice"] = json!("auto");
+    }
+}
+
+fn hosted_function_is_enabled(name: &str, config: &HostedToolLoopConfig) -> bool {
+    match HostedToolCallKind::from_function_name(name) {
         Some(HostedToolCallKind::WebSearch) => config.web_search.is_some(),
         Some(HostedToolCallKind::ImageGeneration) => config.image_generation.is_some(),
         None => false,
-    };
-    if enabled_hosted_tool {
-        request["tool_choice"] = json!("auto");
+    }
+}
+
+fn responses_tool_selector_is_enabled_hosted(
+    tool: &Value,
+    config: &HostedToolLoopConfig,
+) -> bool {
+    match tool.get("type").and_then(Value::as_str) {
+        Some("function") => tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| hosted_function_is_enabled(name, config)),
+        Some("web_search") => config.web_search.is_some(),
+        Some("image_generation") => config.image_generation.is_some(),
+        _ => false,
     }
 }
 
@@ -286,6 +327,16 @@ pub(crate) fn append_tool_outputs_to_responses_request(
     response: &Value,
     tool_messages: Vec<Value>,
 ) -> bool {
+    if let Some(text) = request.get("input").and_then(Value::as_str) {
+        let text = text.to_string();
+        request["input"] = json!([{
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": text
+            }]
+        }]);
+    }
     let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) else {
         return false;
     };
@@ -885,6 +936,72 @@ mod tests {
         assert!(config.is_empty());
         assert!(request.get("tools").is_none());
         assert_eq!(request["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn relax_required_choice_after_hosted_round() {
+        let mut request = json!({"tool_choice":"required"});
+        let config = HostedToolLoopConfig {
+            web_search: Some(HostedWebSearchConfig::default()),
+            image_generation: None,
+        };
+
+        relax_hosted_tool_choice_for_responses_request(&mut request, &config);
+
+        assert_eq!(request["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn relax_required_allowed_tools_after_hosted_round() {
+        let mut request = json!({
+            "tool_choice": {
+                "type":"allowed_tools",
+                "mode":"required",
+                "tools":[
+                    {"type":"function","name":"web_search"},
+                    {"type":"function","name":"shell"}
+                ]
+            }
+        });
+        let config = HostedToolLoopConfig {
+            web_search: Some(HostedWebSearchConfig::default()),
+            image_generation: None,
+        };
+
+        relax_hosted_tool_choice_for_responses_request(&mut request, &config);
+
+        assert_eq!(request["tool_choice"]["mode"], "auto");
+        assert_eq!(request["tool_choice"]["tools"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn append_responses_hosted_output_normalizes_string_input() {
+        let mut request = json!({"input":"hello"});
+        let response = json!({
+            "output":[{
+                "type":"function_call",
+                "call_id":"call_search",
+                "name":"web_search",
+                "arguments":"{}"
+            }]
+        });
+
+        assert!(append_tool_outputs_to_responses_request(
+            &mut request,
+            &response,
+            vec![json!({
+                "role":"tool",
+                "tool_call_id":"call_search",
+                "content":"{}"
+            })],
+        ));
+
+        let input = request["input"].as_array().expect("normalized Responses input");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["type"], "function_call_output");
     }
 
     #[test]

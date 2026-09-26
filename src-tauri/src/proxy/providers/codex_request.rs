@@ -239,7 +239,12 @@ impl CodexThirdPartyRequestPolicy {
         body: Value,
         options: &CodexRequestOptions,
     ) -> Value {
-        apply_responses_history_replay(self.apply_body_policy(body), options.history_replay)
+        // The first upstream request already applied provider body overrides.
+        // Re-merging them here can replace `input` / `tools` arrays wholesale
+        // and erase the hosted tool result that was just appended. Only sanitize
+        // newly replayed upstream items and re-apply the negotiated history policy.
+        let body = canonicalize_value(filter_private_params_with_whitelist(body, &[]));
+        apply_responses_history_replay(body, options.history_replay)
     }
 
     pub(crate) fn finalize_body(
@@ -634,4 +639,53 @@ fn redacted_url(raw: &str) -> String {
 
 fn sha256_hex(value: &[u8]) -> String {
     hex::encode(Sha256::digest(value))
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn continuation_finalization_does_not_reapply_provider_body_override() {
+        let mut provider = Provider::with_id(
+            "test-provider".to_string(),
+            "Test Provider".to_string(),
+            json!({}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            local_proxy_request_overrides: Some(LocalProxyRequestOverrides {
+                body: Some(json!({
+                    "input": [{"role":"user","content":"override"}],
+                    "tool_choice": "required"
+                })),
+                ..LocalProxyRequestOverrides::default()
+            }),
+            ..ProviderMeta::default()
+        });
+        let policy = CodexThirdPartyRequestPolicy {
+            provider,
+            base_url: "https://example.com/v1".to_string(),
+            auth_headers: HeaderMap::new(),
+            authentication_kind: "bearer".to_string(),
+            credential_fingerprint: "test".to_string(),
+            fingerprint: "test".to_string(),
+            is_full_url: false,
+        };
+        let body = json!({
+            "input": [
+                {"role":"user","content":"original"},
+                {"type":"function_call","call_id":"call_search","name":"web_search","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_search","output":"result"}
+            ],
+            "tool_choice": "auto"
+        });
+
+        let finalized =
+            policy.finalize_responses_continuation_body(body.clone(), &CodexRequestOptions::default());
+
+        assert_eq!(finalized["input"], body["input"]);
+        assert_eq!(finalized["tool_choice"], "auto");
+    }
 }

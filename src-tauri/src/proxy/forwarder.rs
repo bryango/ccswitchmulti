@@ -7029,7 +7029,7 @@ where
                             model,
                             provider_id,
                             tool,
-                            false,
+                            force_response_header,
                         );
                     }
                 }
@@ -7039,15 +7039,16 @@ where
                 return Ok(ProxyResponse::buffered(status, headers, body_bytes));
             }
             ResponsesHostedToolCallScan::MixedHostedAndClientToolCalls => {
-                return Err(ProxyError::Internal(
-                    "third-party Responses returned hosted web_search together with a client-owned tool call; CCSwitchMulti cannot safely split mixed tool ownership in one model turn".to_string(),
-                ));
+                log::warn!(
+                    "[Codex] Native Responses hosted tool loop stopped on mixed hosted/client tool ownership"
+                );
+                return Ok(ProxyResponse::buffered(status, headers, body_bytes));
             }
             ResponsesHostedToolCallScan::InvalidHostedToolCall => {
-                return Err(ProxyError::Internal(
-                    "third-party Responses returned a hosted tool call without a usable call_id"
-                        .to_string(),
-                ));
+                log::warn!(
+                    "[Codex] Native Responses hosted tool loop stopped on malformed hosted tool call"
+                );
+                return Ok(ProxyResponse::buffered(status, headers, body_bytes));
             }
             ResponsesHostedToolCallScan::OnlyHosted(calls) if calls.is_empty() => {
                 return Ok(ProxyResponse::buffered(status, headers, body_bytes));
@@ -7059,9 +7060,7 @@ where
             log::warn!(
                 "[Codex] Native Responses hosted tool loop reached max iterations ({MAX_HOSTED_TOOL_ITERATIONS})"
             );
-            return Err(ProxyError::Internal(format!(
-                "native Responses hosted tool loop exceeded {MAX_HOSTED_TOOL_ITERATIONS} continuation rounds without producing a client-consumable response"
-            )));
+            return Ok(ProxyResponse::buffered(status, headers, body_bytes));
         }
 
         let tool_messages = execute_hosted_tool_calls(&calls, config, client, trace_id).await;
@@ -12493,11 +12492,8 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            result,
-            Err(ProxyError::Internal(message))
-                if message.contains("mixed tool ownership")
-        ));
+        let response = result.expect("mixed ownership should pass through");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -12554,11 +12550,8 @@ mod tests {
         .await;
 
         assert_eq!(request["tool_choice"], "auto");
-        assert!(matches!(
-            result,
-            Err(ProxyError::Internal(message))
-                if message.contains("exceeded")
-        ));
+        let response = result.expect("iteration cap should pass through the last response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// 验证 hosted web_search loop 会消费第一轮工具调用、回灌 tool output 并返回最终 Chat 响应。
