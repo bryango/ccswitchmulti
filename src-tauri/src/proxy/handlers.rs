@@ -3182,9 +3182,7 @@ async fn handle_responses_for_app(
         .await;
     }
 
-    if native_hosted_tool_loop_response
-        && response.status().is_success()
-        && !is_codex_v2_compaction
+    if native_hosted_tool_loop_response && response.status().is_success() && !is_codex_v2_compaction
     {
         let (mut response_headers, status, body_bytes) =
             read_decoded_body(response, ctx.tag, std::time::Duration::ZERO).await?;
