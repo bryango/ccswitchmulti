@@ -6,8 +6,11 @@ use super::hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES};
 use super::providers::{
     hosted_tools::bridge::{
         append_tool_outputs_to_chat_request, append_tool_outputs_to_responses_request,
-        execute_hosted_tool_calls, project_hosted_tools_for_responses_request,
-        relax_hosted_tool_choice_for_responses_request, scan_hosted_tool_calls,
+        disable_projected_hosted_functions_for_responses_request, execute_hosted_tool_calls,
+        hosted_tool_error_messages, normalize_responses_input_for_hosted_continuation,
+        project_hosted_tools_for_responses_request,
+        relax_hosted_tool_choice_for_responses_request,
+        remove_projected_hosted_function_calls_from_responses_response, scan_hosted_tool_calls,
         scan_responses_hosted_tool_calls, HostedToolCall, HostedToolCallKind, HostedToolCallScan,
         HostedToolLoopConfig, ResponsesHostedToolCallScan, HOSTED_TOOL_LOOP_HEADER,
         MAX_HOSTED_TOOL_ITERATIONS,
@@ -3200,8 +3203,8 @@ impl RequestForwarder {
             &filtered_body,
             self.session_client_provided,
         );
-        let request_is_streaming =
-            is_streaming_request(&effective_endpoint, &filtered_body, headers);
+        let request_is_streaming = !native_hosted_tools_forced_non_stream
+            && is_streaming_request(&effective_endpoint, &filtered_body, headers);
         let force_identity_encoding = needs_transform
             || codex_responses_to_chat
             || codex_responses_to_messages
@@ -3875,6 +3878,12 @@ impl RequestForwarder {
                     .as_ref()
                     .and_then(|meta| meta.local_proxy_request_overrides.as_ref()),
                 is_copilot,
+            );
+        }
+        if native_hosted_tools_forced_non_stream {
+            ordered_headers.insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("application/json"),
             );
         }
         apply_opencode_go_identity(
@@ -4556,6 +4565,7 @@ impl RequestForwarder {
                         &self.session_id,
                         &request_model_for_log,
                         &provider.id,
+                        timeout,
                     )
                     .await?
                 } else {
@@ -6993,6 +7003,7 @@ async fn run_hosted_tool_responses_loop<F, Fut>(
     session_id: &str,
     model: &str,
     provider_id: &str,
+    response_body_timeout: Duration,
 ) -> Result<ProxyResponse, ProxyError>
 where
     F: FnMut(&Value) -> Fut,
@@ -7001,7 +7012,8 @@ where
     let mut loop_executed = false;
 
     for iteration in 0..=MAX_HOSTED_TOOL_ITERATIONS {
-        let (status, mut headers, body_bytes) = read_decoded_proxy_response(response).await?;
+        let (status, mut headers, body_bytes) =
+            read_decoded_proxy_response_with_timeout(response, response_body_timeout).await?;
         if !status.is_success() {
             return Ok(ProxyResponse::buffered(status, headers, body_bytes));
         }
@@ -7042,13 +7054,23 @@ where
                 log::warn!(
                     "[Codex] Native Responses hosted tool loop stopped on mixed hosted/client tool ownership"
                 );
-                return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+                return buffered_native_responses_without_projected_hosted_calls(
+                    status,
+                    headers,
+                    responses_response,
+                    config,
+                );
             }
             ResponsesHostedToolCallScan::InvalidHostedToolCall => {
                 log::warn!(
                     "[Codex] Native Responses hosted tool loop stopped on malformed hosted tool call"
                 );
-                return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+                return buffered_native_responses_without_projected_hosted_calls(
+                    status,
+                    headers,
+                    responses_response,
+                    config,
+                );
             }
             ResponsesHostedToolCallScan::OnlyHosted(calls) if calls.is_empty() => {
                 return Ok(ProxyResponse::buffered(status, headers, body_bytes));
@@ -7056,11 +7078,77 @@ where
             ResponsesHostedToolCallScan::OnlyHosted(calls) => calls,
         };
 
+        if !normalize_responses_input_for_hosted_continuation(responses_request) {
+            log::warn!(
+                "[Codex] Native Responses hosted tool loop skipped because input cannot be normalized"
+            );
+            return buffered_native_responses_without_projected_hosted_calls(
+                status,
+                headers,
+                responses_response,
+                config,
+            );
+        }
+
         if iteration >= MAX_HOSTED_TOOL_ITERATIONS {
             log::warn!(
-                "[Codex] Native Responses hosted tool loop reached max iterations ({MAX_HOSTED_TOOL_ITERATIONS})"
+                "[Codex] Native Responses hosted tool loop reached max iterations ({MAX_HOSTED_TOOL_ITERATIONS}); asking the model to finish without another search"
             );
-            return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+            let tool_messages = hosted_tool_error_messages(
+                &calls,
+                "web search continuation limit reached; continue without another search",
+            );
+            if !append_tool_outputs_to_responses_request(
+                responses_request,
+                &responses_response,
+                tool_messages,
+            ) {
+                return buffered_native_responses_without_projected_hosted_calls(
+                    status,
+                    headers,
+                    responses_response,
+                    config,
+                );
+            }
+            disable_projected_hosted_functions_for_responses_request(responses_request, config);
+            let recovery = send_responses_request(responses_request).await?;
+            let (recovery_status, mut recovery_headers, recovery_body) =
+                read_decoded_proxy_response_with_timeout(recovery, response_body_timeout).await?;
+            if force_response_header || loop_executed {
+                mark_hosted_tool_loop_response(&mut recovery_headers);
+            }
+            if !recovery_status.is_success() {
+                return Ok(ProxyResponse::buffered(
+                    recovery_status,
+                    recovery_headers,
+                    recovery_body,
+                ));
+            }
+            let mut recovery_value: Value = match serde_json::from_slice(&recovery_body) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(ProxyResponse::buffered(
+                        recovery_status,
+                        recovery_headers,
+                        recovery_body,
+                    ));
+                }
+            };
+            remove_projected_hosted_function_calls_from_responses_response(
+                &mut recovery_value,
+                config,
+            );
+            strip_proxy_response_entity_headers(&mut recovery_headers);
+            let recovery_body = serde_json::to_vec(&recovery_value).map_err(|error| {
+                ProxyError::Internal(format!(
+                    "Failed to serialize native Responses hosted recovery response: {error}"
+                ))
+            })?;
+            return Ok(ProxyResponse::buffered(
+                recovery_status,
+                recovery_headers,
+                Bytes::from(recovery_body),
+            ));
         }
 
         let tool_messages = execute_hosted_tool_calls(&calls, config, client, trace_id).await;
@@ -7072,7 +7160,12 @@ where
             log::warn!(
                 "[Codex] Native Responses hosted tool loop could not append function_call_output"
             );
-            return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+            return buffered_native_responses_without_projected_hosted_calls(
+                status,
+                headers,
+                responses_response,
+                config,
+            );
         }
         relax_hosted_tool_choice_for_responses_request(responses_request, config);
 
@@ -7192,6 +7285,39 @@ where
 ///
 /// 副作用:
 /// - 消费 response body；如果执行了解压，会移除 content-encoding/content-length。
+async fn read_decoded_proxy_response_with_timeout(
+    response: ProxyResponse,
+    timeout: Duration,
+) -> Result<(http::StatusCode, http::HeaderMap, Bytes), ProxyError> {
+    if timeout.is_zero() {
+        return read_decoded_proxy_response(response).await;
+    }
+    tokio::time::timeout(timeout, read_decoded_proxy_response(response))
+        .await
+        .map_err(|_| {
+            ProxyError::ResponsePending(format!(
+                "hosted Responses buffered body timeout after {}s",
+                timeout.as_secs()
+            ))
+        })?
+}
+
+fn buffered_native_responses_without_projected_hosted_calls(
+    status: http::StatusCode,
+    mut headers: http::HeaderMap,
+    mut response: Value,
+    config: &HostedToolLoopConfig,
+) -> Result<ProxyResponse, ProxyError> {
+    remove_projected_hosted_function_calls_from_responses_response(&mut response, config);
+    strip_proxy_response_entity_headers(&mut headers);
+    let body = serde_json::to_vec(&response).map_err(|error| {
+        ProxyError::Internal(format!(
+            "Failed to serialize native Responses hosted fallback response: {error}"
+        ))
+    })?;
+    Ok(ProxyResponse::buffered(status, headers, Bytes::from(body)))
+}
+
 async fn read_decoded_proxy_response(
     response: ProxyResponse,
 ) -> Result<(http::StatusCode, http::HeaderMap, Bytes), ProxyError> {
@@ -12419,6 +12545,7 @@ mod tests {
             "session",
             "deepseek-flash",
             "provider",
+            Duration::ZERO,
         )
         .await
         .expect("native hosted web_search loop should finish");
@@ -12489,11 +12616,18 @@ mod tests {
             "session",
             "deepseek-flash",
             "provider",
+            Duration::ZERO,
         )
         .await;
 
         let response = result.expect("mixed ownership should pass through");
         assert_eq!(response.status(), StatusCode::OK);
+        let (_, _, body) = read_decoded_proxy_response(response)
+            .await
+            .expect("read mixed fallback");
+        let value: Value = serde_json::from_slice(&body).expect("mixed fallback JSON");
+        assert_eq!(value["output"].as_array().unwrap().len(), 1);
+        assert_eq!(value["output"][0]["type"], "custom_tool_call");
     }
 
     #[tokio::test]
@@ -12530,13 +12664,33 @@ mod tests {
                 image_generation: None,
             },
             &Err("test no credentials".to_string()),
-            move |_body| {
-                let body = hosted_response_for_closure.clone();
+            move |body| {
+                let hosted_response = hosted_response_for_closure.clone();
+                let hosted_enabled = body
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| {
+                        tools.iter().any(|tool| {
+                            tool.get("name").and_then(Value::as_str) == Some("web_search")
+                        })
+                    });
                 async move {
+                    let body = if hosted_enabled {
+                        hosted_response.as_str().to_string()
+                    } else {
+                        json!({
+                            "output":[{
+                                "type":"message",
+                                "role":"assistant",
+                                "content":[{"type":"output_text","text":"done"}]
+                            }]
+                        })
+                        .to_string()
+                    };
                     Ok(ProxyResponse::buffered(
                         StatusCode::OK,
                         HeaderMap::new(),
-                        Bytes::from(body.as_str().to_string()),
+                        Bytes::from(body),
                     ))
                 }
             },
@@ -12546,12 +12700,19 @@ mod tests {
             "session",
             "deepseek-flash",
             "provider",
+            Duration::ZERO,
         )
         .await;
 
         assert_eq!(request["tool_choice"], "auto");
-        let response = result.expect("iteration cap should pass through the last response");
+        assert!(request.get("tools").is_none());
+        let response = result.expect("iteration cap recovery should finish");
         assert_eq!(response.status(), StatusCode::OK);
+        let (_, _, body) = read_decoded_proxy_response(response)
+            .await
+            .expect("read cap recovery");
+        let value: Value = serde_json::from_slice(&body).expect("cap recovery JSON");
+        assert_eq!(value["output"][0]["type"], "message");
     }
 
     /// 验证 hosted web_search loop 会消费第一轮工具调用、回灌 tool output 并返回最终 Chat 响应。
@@ -13552,6 +13713,15 @@ mod tests {
             &json!({ "model": "gemini-2.5-pro" }),
             &headers
         ));
+    }
+
+    #[test]
+    fn forced_native_hosted_buffer_ignores_sse_accept_for_upstream_streaming() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let body = json!({"stream": false});
+
+        assert!(!(!true && is_streaming_request("/v1/responses", &body, &headers)));
     }
 
     #[test]

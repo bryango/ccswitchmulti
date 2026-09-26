@@ -319,20 +319,97 @@ pub(crate) fn scan_responses_hosted_tool_calls(
     }
 }
 
+pub(crate) fn normalize_responses_input_for_hosted_continuation(
+    request: &mut Value,
+) -> bool {
+    match request.get("input").cloned() {
+        None | Some(Value::Null) => {
+            request["input"] = json!([]);
+            true
+        }
+        Some(Value::Array(_)) => true,
+        Some(Value::Object(item)) => {
+            request["input"] = Value::Array(vec![Value::Object(item)]);
+            true
+        }
+        Some(Value::String(text)) => {
+            request["input"] = json!([{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": text
+                }]
+            }]);
+            true
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn remove_projected_hosted_function_calls_from_responses_response(
+    response: &mut Value,
+    config: &HostedToolLoopConfig,
+) -> usize {
+    let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let before = output.len();
+    output.retain(|item| {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return true;
+        }
+        let Some(name) = item.get("name").and_then(Value::as_str) else {
+            return true;
+        };
+        !hosted_function_is_enabled(name, config)
+    });
+    before.saturating_sub(output.len())
+}
+
+pub(crate) fn disable_projected_hosted_functions_for_responses_request(
+    request: &mut Value,
+    config: &HostedToolLoopConfig,
+) {
+    if let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| {
+            if tool.get("type").and_then(Value::as_str) != Some("function") {
+                return true;
+            }
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                return true;
+            };
+            !hosted_function_is_enabled(name, config)
+        });
+        if tools.is_empty() {
+            request.as_object_mut().unwrap().remove("tools");
+        }
+    }
+    request["tool_choice"] = json!("auto");
+}
+
+pub(crate) fn hosted_tool_error_messages(
+    calls: &[HostedToolCall],
+    message: &str,
+) -> Vec<Value> {
+    calls
+        .iter()
+        .map(|call| {
+            json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json!({"error": message}).to_string()
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn append_tool_outputs_to_responses_request(
     request: &mut Value,
     response: &Value,
     tool_messages: Vec<Value>,
 ) -> bool {
-    if let Some(text) = request.get("input").and_then(Value::as_str) {
-        let text = text.to_string();
-        request["input"] = json!([{
-            "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": text
-            }]
-        }]);
+    if !normalize_responses_input_for_hosted_continuation(request) {
+        return false;
     }
     let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) else {
         return false;
@@ -969,6 +1046,48 @@ mod tests {
 
         assert_eq!(request["tool_choice"]["mode"], "auto");
         assert_eq!(request["tool_choice"]["tools"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn normalize_responses_hosted_input_wraps_object_and_absent() {
+        let mut object_request = json!({
+            "input": {"role":"user","content":[{"type":"input_text","text":"hello"}]}
+        });
+        assert!(normalize_responses_input_for_hosted_continuation(
+            &mut object_request
+        ));
+        assert_eq!(object_request["input"].as_array().unwrap().len(), 1);
+        assert_eq!(object_request["input"][0]["role"], "user");
+
+        let mut absent_request = json!({});
+        assert!(normalize_responses_input_for_hosted_continuation(
+            &mut absent_request
+        ));
+        assert_eq!(absent_request["input"], json!([]));
+    }
+
+    #[test]
+    fn strip_projected_hosted_calls_preserves_client_calls() {
+        let config = HostedToolLoopConfig {
+            web_search: Some(HostedWebSearchConfig::default()),
+            image_generation: None,
+        };
+        let mut response = json!({
+            "output": [
+                {"type":"function_call","call_id":"search","name":"web_search","arguments":"{}"},
+                {"type":"custom_tool_call","call_id":"patch","name":"apply_patch","input":"x"}
+            ]
+        });
+
+        assert_eq!(
+            remove_projected_hosted_function_calls_from_responses_response(
+                &mut response,
+                &config
+            ),
+            1
+        );
+        assert_eq!(response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(response["output"][0]["type"], "custom_tool_call");
     }
 
     #[test]
