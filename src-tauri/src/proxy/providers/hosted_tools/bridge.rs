@@ -81,6 +81,10 @@ pub(crate) fn project_hosted_tools_for_responses_request(
     request: &mut Value,
     web_search_enabled: bool,
 ) -> HostedToolLoopConfig {
+    if !web_search_enabled {
+        return HostedToolLoopConfig::default();
+    }
+
     let mut config = HostedToolLoopConfig::default();
     let mut saw_hosted_web_search = false;
     let mut saw_hosted_image_generation = false;
@@ -364,6 +368,36 @@ pub(crate) fn remove_projected_hosted_function_calls_from_responses_response(
     before.saturating_sub(output.len())
 }
 
+pub(crate) fn ensure_responses_client_output(response: &mut Value, fallback_text: &str) {
+    let has_client_output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|output| {
+            output.iter().any(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|item_type| item_type == "message" || item_type.ends_with("_call"))
+            })
+        });
+    if has_client_output {
+        return;
+    }
+
+    let fallback = json!({
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": fallback_text
+        }]
+    });
+    match response.get_mut("output").and_then(Value::as_array_mut) {
+        Some(output) => output.push(fallback),
+        None => response["output"] = Value::Array(vec![fallback]),
+    }
+}
+
 pub(crate) fn disable_projected_hosted_functions_for_responses_request(
     request: &mut Value,
     config: &HostedToolLoopConfig,
@@ -392,10 +426,23 @@ pub(crate) fn hosted_tool_error_messages(calls: &[HostedToolCall], message: &str
     calls
         .iter()
         .map(|call| {
+            let content = match call.kind {
+                HostedToolCallKind::WebSearch => {
+                    let args = web_search::parse_arguments(&call.arguments);
+                    web_search::error_tool_content(&args.query, message)
+                }
+                HostedToolCallKind::ImageGeneration => {
+                    let args = image_generation::parse_arguments(
+                        &call.arguments,
+                        &HostedImageGenerationConfig::default(),
+                    );
+                    image_generation::error_tool_content(&args.prompt, message)
+                }
+            };
             json!({
                 "role": "tool",
                 "tool_call_id": call.id.clone(),
-                "content": json!({"error": message}).to_string()
+                "content": content
             })
         })
         .collect()
@@ -406,22 +453,56 @@ pub(crate) fn append_tool_outputs_to_responses_request(
     response: &Value,
     tool_messages: Vec<Value>,
 ) -> bool {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return false;
+    };
+
+    let tool_call_ids = tool_messages
+        .iter()
+        .map(|message| {
+            message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .filter(|call_id| !call_id.is_empty())
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(tool_call_ids) = tool_call_ids else {
+        return false;
+    };
+    let response_call_ids = output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .map(|item| {
+            item.get("call_id")
+                .and_then(Value::as_str)
+                .filter(|call_id| !call_id.is_empty())
+                .or_else(|| item.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(response_call_ids) = response_call_ids else {
+        return false;
+    };
+    let unique = |ids: &[&str]| {
+        ids.iter()
+            .enumerate()
+            .all(|(index, id)| !ids[..index].contains(id))
+    };
+    if tool_call_ids.len() != response_call_ids.len()
+        || !unique(&tool_call_ids)
+        || !unique(&response_call_ids)
+        || tool_call_ids
+            .iter()
+            .any(|call_id| !response_call_ids.contains(call_id))
+    {
+        return false;
+    }
+
     if !normalize_responses_input_for_hosted_continuation(request) {
         return false;
     }
     let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) else {
         return false;
     };
-    let Some(output) = response.get("output").and_then(Value::as_array) else {
-        return false;
-    };
-
-    let hosted_call_ids = tool_messages
-        .iter()
-        .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
-        .filter(|call_id| !call_id.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
 
     for item in output {
         match item.get("type").and_then(Value::as_str) {
@@ -431,17 +512,8 @@ pub(crate) fn append_tool_outputs_to_responses_request(
                     .get("call_id")
                     .and_then(Value::as_str)
                     .filter(|call_id| !call_id.is_empty())
-                    .or_else(|| item.get("id").and_then(Value::as_str));
-                let Some(replay_call_id) = replay_call_id else {
-                    continue;
-                };
-                if !hosted_call_ids
-                    .iter()
-                    .any(|call_id| call_id == replay_call_id)
-                {
-                    continue;
-                }
-
+                    .or_else(|| item.get("id").and_then(Value::as_str))
+                    .expect("validated function_call id");
                 let mut replay = item.clone();
                 if replay
                     .get("call_id")
@@ -459,14 +531,11 @@ pub(crate) fn append_tool_outputs_to_responses_request(
         let call_id = message
             .get("tool_call_id")
             .and_then(Value::as_str)
-            .unwrap_or("");
+            .expect("validated tool_call_id");
         let content = message
             .get("content")
             .cloned()
             .unwrap_or(Value::String(String::new()));
-        if call_id.is_empty() {
-            return false;
-        }
         input.push(json!({
             "type": "function_call_output",
             "call_id": call_id,
@@ -945,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn project_disabled_native_hosted_tools_are_omitted() {
+    fn project_disabled_native_hosted_tools_are_preserved() {
         let mut request = json!({
             "tools": [
                 {"type":"web_search"},
@@ -954,13 +1023,12 @@ mod tests {
             ],
             "tool_choice": {"type":"web_search"}
         });
+        let original = request.clone();
 
         let config = project_hosted_tools_for_responses_request(&mut request, false);
 
         assert!(config.is_empty());
-        assert_eq!(request["tools"].as_array().unwrap().len(), 1);
-        assert_eq!(request["tools"][0]["name"], "shell");
-        assert_eq!(request["tool_choice"], "auto");
+        assert_eq!(request, original);
     }
 
     #[test]
@@ -993,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn project_empty_allowed_tools_downgrades_to_auto() {
+    fn project_disabled_allowed_tools_are_preserved() {
         let mut request = json!({
             "tools": [{"type":"web_search"}],
             "tool_choice": {
@@ -1002,12 +1070,12 @@ mod tests {
                 "tools":[{"type":"web_search"}]
             }
         });
+        let original = request.clone();
 
         let config = project_hosted_tools_for_responses_request(&mut request, false);
 
         assert!(config.is_empty());
-        assert!(request.get("tools").is_none());
-        assert_eq!(request["tool_choice"], "auto");
+        assert_eq!(request, original);
     }
 
     #[test]
@@ -1047,6 +1115,24 @@ mod tests {
     }
 
     #[test]
+    fn hosted_tool_error_messages_preserve_web_search_query_context() {
+        let messages = hosted_tool_error_messages(
+            &[HostedToolCall {
+                kind: HostedToolCallKind::WebSearch,
+                id: "call_search".to_string(),
+                arguments: "{\"query\":\"OpenAI\"}".to_string(),
+            }],
+            "limit reached",
+        );
+
+        let content: Value =
+            serde_json::from_str(messages[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["query"], "OpenAI");
+        assert_eq!(content["sources"], json!([]));
+        assert_eq!(content["error"], "limit reached");
+    }
+
+    #[test]
     fn normalize_responses_hosted_input_wraps_object_and_absent() {
         let mut object_request = json!({
             "input": {"role":"user","content":[{"type":"input_text","text":"hello"}]}
@@ -1083,6 +1169,32 @@ mod tests {
         );
         assert_eq!(response["output"].as_array().unwrap().len(), 1);
         assert_eq!(response["output"][0]["type"], "custom_tool_call");
+    }
+
+    #[test]
+    fn ensure_responses_client_output_fills_empty_after_strip() {
+        let config = HostedToolLoopConfig {
+            web_search: Some(HostedWebSearchConfig::default()),
+            image_generation: None,
+        };
+        let mut response = json!({
+            "output": [{
+                "type":"function_call",
+                "call_id":"search",
+                "name":"web_search",
+                "arguments":"{}"
+            }]
+        });
+
+        remove_projected_hosted_function_calls_from_responses_response(&mut response, &config);
+        ensure_responses_client_output(&mut response, "Search could not be completed.");
+
+        assert_eq!(response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(response["output"][0]["type"], "message");
+        assert_eq!(
+            response["output"][0]["content"][0]["text"],
+            "Search could not be completed."
+        );
     }
 
     #[test]
@@ -1277,6 +1389,31 @@ mod tests {
         assert_eq!(input[0]["call_id"], "call_search");
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_search");
+    }
+
+    #[test]
+    fn append_responses_hosted_output_rejects_mismatched_call_ids() {
+        let mut request = json!({"input":[]});
+        let original = request.clone();
+        let response = json!({
+            "output":[{
+                "type":"function_call",
+                "call_id":"call_search",
+                "name":"web_search",
+                "arguments":"{}"
+            }]
+        });
+
+        assert!(!append_tool_outputs_to_responses_request(
+            &mut request,
+            &response,
+            vec![json!({
+                "role":"tool",
+                "tool_call_id":"call_other",
+                "content":"{}"
+            })],
+        ));
+        assert_eq!(request, original);
     }
 
     #[test]

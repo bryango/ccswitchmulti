@@ -7,8 +7,9 @@ use super::providers::{
     hosted_tools::bridge::{
         append_tool_outputs_to_chat_request, append_tool_outputs_to_responses_request,
         disable_projected_hosted_functions_for_responses_request, execute_hosted_tool_calls,
-        hosted_tool_error_messages, normalize_responses_input_for_hosted_continuation,
-        project_hosted_tools_for_responses_request, relax_hosted_tool_choice_for_responses_request,
+        ensure_responses_client_output, hosted_tool_error_messages,
+        normalize_responses_input_for_hosted_continuation, project_hosted_tools_for_responses_request,
+        relax_hosted_tool_choice_for_responses_request,
         remove_projected_hosted_function_calls_from_responses_response, scan_hosted_tool_calls,
         scan_responses_hosted_tool_calls, HostedToolCall, HostedToolCallKind, HostedToolCallScan,
         HostedToolLoopConfig, ResponsesHostedToolCallScan, HOSTED_TOOL_LOOP_HEADER,
@@ -7141,6 +7142,10 @@ where
                 &mut recovery_value,
                 config,
             );
+            ensure_responses_client_output(
+                &mut recovery_value,
+                "Web search could not continue after reaching the hosted search limit.",
+            );
             strip_proxy_response_entity_headers(&mut recovery_headers);
             let recovery_body = serde_json::to_vec(&recovery_value).map_err(|error| {
                 ProxyError::Internal(format!(
@@ -7312,6 +7317,10 @@ fn buffered_native_responses_without_projected_hosted_calls(
     config: &HostedToolLoopConfig,
 ) -> Result<ProxyResponse, ProxyError> {
     remove_projected_hosted_function_calls_from_responses_response(&mut response, config);
+    ensure_responses_client_output(
+        &mut response,
+        "Web search could not be completed for this turn.",
+    );
     strip_proxy_response_entity_headers(&mut headers);
     let body = serde_json::to_vec(&response).map_err(|error| {
         ProxyError::Internal(format!(
