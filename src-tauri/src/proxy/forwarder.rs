@@ -6,10 +6,10 @@ use super::hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES};
 use super::providers::{
     hosted_tools::bridge::{
         append_tool_outputs_to_chat_request, append_tool_outputs_to_responses_request,
-        disable_projected_hosted_functions_for_responses_request, execute_hosted_tool_calls,
-        ensure_responses_client_output, hosted_tool_error_messages,
-        normalize_responses_input_for_hosted_continuation, project_hosted_tools_for_responses_request,
-        relax_hosted_tool_choice_for_responses_request,
+        disable_projected_hosted_functions_for_responses_request, ensure_responses_client_output,
+        execute_hosted_tool_calls, hosted_tool_error_messages,
+        normalize_responses_input_for_hosted_continuation,
+        project_hosted_tools_for_responses_request, relax_hosted_tool_choice_for_responses_request,
         remove_projected_hosted_function_calls_from_responses_response, scan_hosted_tool_calls,
         scan_responses_hosted_tool_calls, HostedToolCall, HostedToolCallKind, HostedToolCallScan,
         HostedToolLoopConfig, ResponsesHostedToolCallScan, HOSTED_TOOL_LOOP_HEADER,
