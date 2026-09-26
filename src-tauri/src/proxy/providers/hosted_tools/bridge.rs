@@ -319,9 +319,7 @@ pub(crate) fn scan_responses_hosted_tool_calls(
     }
 }
 
-pub(crate) fn normalize_responses_input_for_hosted_continuation(
-    request: &mut Value,
-) -> bool {
+pub(crate) fn normalize_responses_input_for_hosted_continuation(request: &mut Value) -> bool {
     match request.get("input").cloned() {
         None | Some(Value::Null) => {
             request["input"] = json!([]);
@@ -390,10 +388,7 @@ pub(crate) fn disable_projected_hosted_functions_for_responses_request(
     request["tool_choice"] = json!("auto");
 }
 
-pub(crate) fn hosted_tool_error_messages(
-    calls: &[HostedToolCall],
-    message: &str,
-) -> Vec<Value> {
+pub(crate) fn hosted_tool_error_messages(calls: &[HostedToolCall], message: &str) -> Vec<Value> {
     calls
         .iter()
         .map(|call| {
@@ -1083,10 +1078,7 @@ mod tests {
         });
 
         assert_eq!(
-            remove_projected_hosted_function_calls_from_responses_response(
-                &mut response,
-                &config
-            ),
+            remove_projected_hosted_function_calls_from_responses_response(&mut response, &config),
             1
         );
         assert_eq!(response["output"].as_array().unwrap().len(), 1);
