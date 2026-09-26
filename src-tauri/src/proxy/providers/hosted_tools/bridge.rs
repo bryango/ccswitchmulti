@@ -476,7 +476,11 @@ pub(crate) fn append_tool_outputs_to_responses_request(
             item.get("call_id")
                 .and_then(Value::as_str)
                 .filter(|call_id| !call_id.is_empty())
-                .or_else(|| item.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()))
+                .or_else(|| {
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                })
         })
         .collect::<Option<Vec<_>>>();
     let Some(response_call_ids) = response_call_ids else {
