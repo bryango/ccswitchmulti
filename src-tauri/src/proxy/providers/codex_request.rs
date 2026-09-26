@@ -682,8 +682,8 @@ mod continuation_tests {
             "tool_choice": "auto"
         });
 
-        let finalized =
-            policy.finalize_responses_continuation_body(body.clone(), &CodexRequestOptions::default());
+        let finalized = policy
+            .finalize_responses_continuation_body(body.clone(), &CodexRequestOptions::default());
 
         assert_eq!(finalized["input"], body["input"]);
         assert_eq!(finalized["tool_choice"], "auto");
