@@ -271,7 +271,7 @@ fn is_nonempty_final_content(content: &Value) -> bool {
     }
 }
 
-fn is_client_tool_call_type(item_type: &str) -> bool {
+pub(crate) fn is_client_tool_call_type(item_type: &str) -> bool {
     matches!(
         item_type,
         "function_call"
