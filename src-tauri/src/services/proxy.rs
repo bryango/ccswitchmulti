@@ -5793,7 +5793,18 @@ mod tests {
         }
 
         drop(blocker);
-        service.retry_pending_takeover_restore().await;
+
+        // Production retries this intent every 5 seconds. A just-released ephemeral
+        // port can remain briefly unavailable (or be transiently reused), so the
+        // test must verify eventual recovery rather than require the first retry
+        // immediately after drop(blocker) to win the bind race.
+        for _ in 0..20 {
+            service.retry_pending_takeover_restore().await;
+            if service.pending_takeover_restore.lock().await.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         // 失败时带出 pending 现场（attempts + last_error）：此前 macOS CI 首跑
         // 只报 is_none() 断言，看不到恢复重试的具体错误。
