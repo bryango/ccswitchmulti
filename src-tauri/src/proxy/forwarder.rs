@@ -12575,10 +12575,7 @@ mod tests {
             .expect("read incomplete response");
         let value: Value = serde_json::from_slice(&body).expect("incomplete response JSON");
         assert_eq!(value["status"], "incomplete");
-        assert_eq!(
-            value["incomplete_details"]["reason"],
-            "max_output_tokens"
-        );
+        assert_eq!(value["incomplete_details"]["reason"], "max_output_tokens");
     }
 
     #[tokio::test]

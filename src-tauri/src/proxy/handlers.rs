@@ -7732,7 +7732,10 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
             let terminal = events.last().expect("terminal event");
             assert_eq!(terminal.0, expected_event);
             assert_eq!(
-                terminal.1.pointer("/response/status").and_then(Value::as_str),
+                terminal
+                    .1
+                    .pointer("/response/status")
+                    .and_then(Value::as_str),
                 Some(status)
             );
         }
