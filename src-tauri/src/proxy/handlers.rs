@@ -4727,7 +4727,7 @@ fn responses_response_to_full_sse(response: &Value) -> Result<Bytes, ProxyError>
         message_close, message_content_part_added, message_item_added, output_item_added,
         output_item_done, output_text_delta, reasoning_close, reasoning_item_added,
         reasoning_summary_part_added, reasoning_summary_text_delta, response_completed,
-        response_created, response_in_progress,
+        response_created, response_failed, response_in_progress, response_incomplete,
     };
 
     let mut events: Vec<Bytes> = Vec::new();
@@ -4832,7 +4832,11 @@ fn responses_response_to_full_sse(response: &Value) -> Result<Bytes, ProxyError>
         }
     }
 
-    events.push(response_completed(response));
+    match response.get("status").and_then(Value::as_str) {
+        Some("incomplete") => events.push(response_incomplete(response)),
+        Some("failed") => events.push(response_failed(response)),
+        _ => events.push(response_completed(response)),
+    }
 
     Ok(Bytes::from(
         events
@@ -7695,6 +7699,43 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
             events[search_done].1["item"]["arguments"]["query"],
             "find tools"
         );
+    }
+
+    #[test]
+    fn full_sse_wrapper_preserves_terminal_status() {
+        for (status, expected_event) in [
+            ("completed", "response.completed"),
+            ("incomplete", "response.incomplete"),
+            ("failed", "response.failed"),
+        ] {
+            let response = json!({
+                "id": format!("resp_{status}"),
+                "status": status,
+                "model": "deepseek-flash",
+                "output": [],
+                "incomplete_details": if status == "incomplete" {
+                    json!({"reason":"max_output_tokens"})
+                } else {
+                    Value::Null
+                }
+            });
+
+            let body = responses_response_to_full_sse(&response).unwrap();
+            let text = std::str::from_utf8(&body).expect("valid sse utf8");
+            let terminal_block = text.trim_end().rsplit("\n\n").next().unwrap_or("");
+
+            assert!(
+                terminal_block.starts_with(&format!("event: {expected_event}\n")),
+                "status={status} ended with unexpected terminal event: {terminal_block}"
+            );
+            let events = parse_responses_sse_events(text);
+            let terminal = events.last().expect("terminal event");
+            assert_eq!(terminal.0, expected_event);
+            assert_eq!(
+                terminal.1.pointer("/response/status").and_then(Value::as_str),
+                Some(status)
+            );
+        }
     }
 
     #[test]

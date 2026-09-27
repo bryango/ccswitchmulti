@@ -7026,6 +7026,13 @@ where
             mark_hosted_tool_loop_response(&mut headers);
         }
 
+        if matches!(
+            responses_response.get("status").and_then(Value::as_str),
+            Some("incomplete" | "failed")
+        ) {
+            return Ok(ProxyResponse::buffered(status, headers, body_bytes));
+        }
+
         let calls = match scan_responses_hosted_tool_calls(&responses_response, config) {
             ResponsesHostedToolCallScan::NoToolCalls => {
                 if !loop_executed {
@@ -12501,6 +12508,77 @@ mod tests {
             Err(ProxyError::Internal(message))
                 if message.contains("client-owned tool calls")
         ));
+    }
+
+    #[tokio::test]
+    async fn native_responses_hosted_loop_preserves_incomplete_turn() {
+        use crate::proxy::providers::hosted_tools::web_search::HostedWebSearchConfig;
+
+        let initial_response = ProxyResponse::buffered(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from(
+                json!({
+                    "id":"resp_incomplete",
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":"max_output_tokens"},
+                    "output":[{
+                        "type":"function_call",
+                        "status":"incomplete",
+                        "call_id":"call_search",
+                        "name":"web_search",
+                        "arguments":"{\"query\":\"half"
+                    }]
+                })
+                .to_string(),
+            ),
+        );
+        let mut request = json!({"input":[],"stream":false});
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sends_for_closure = sends.clone();
+
+        let response = run_hosted_tool_responses_loop(
+            initial_response,
+            &mut request,
+            &HostedToolLoopConfig {
+                web_search: Some(HostedWebSearchConfig::default()),
+                image_generation: None,
+            },
+            &Err("hosted search must not execute".to_string()),
+            move |_body| {
+                let sends = sends_for_closure.clone();
+                async move {
+                    sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(ProxyError::Internal(
+                        "incomplete turn must not continue upstream".to_string(),
+                    ))
+                }
+            },
+            None,
+            true,
+            None,
+            "session",
+            "deepseek-flash",
+            "provider",
+        )
+        .await
+        .expect("incomplete response should pass through");
+
+        assert_eq!(
+            sends.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "incomplete hosted call must not execute or continue"
+        );
+        assert!(response.headers().contains_key(HOSTED_TOOL_LOOP_HEADER));
+        let (_, _, body) = read_decoded_proxy_response(response)
+            .await
+            .expect("read incomplete response");
+        let value: Value = serde_json::from_slice(&body).expect("incomplete response JSON");
+        assert_eq!(value["status"], "incomplete");
+        assert_eq!(
+            value["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
     }
 
     #[tokio::test]

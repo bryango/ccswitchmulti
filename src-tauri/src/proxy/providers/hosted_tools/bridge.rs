@@ -189,7 +189,10 @@ pub(crate) fn scan_responses_hosted_tool_calls(
                     arguments,
                 });
             }
-            Some("custom_tool_call" | "tool_search_call" | "local_shell_call" | "mcp_tool_call") => {
+            Some(item_type)
+                if crate::proxy::providers::codex_terminal::is_client_tool_call_type(item_type)
+                    || matches!(item_type, "mcp_tool_call" | "computer_call") =>
+            {
                 saw_client_tool = true;
             }
             _ => {}
@@ -843,27 +846,42 @@ mod tests {
             web_search: Some(HostedWebSearchConfig::default()),
             image_generation: None,
         };
-        let response = json!({
-            "output": [
-                {
-                    "type":"function_call",
-                    "call_id":"call_search",
-                    "name":"web_search",
-                    "arguments":"{}"
-                },
-                {
-                    "type":"custom_tool_call",
-                    "call_id":"call_patch",
-                    "name":"apply_patch",
-                    "input":"*** Begin Patch"
-                }
-            ]
-        });
 
-        assert_eq!(
-            scan_responses_hosted_tool_calls(&response, &config),
-            ResponsesHostedToolCallScan::MixedHostedAndClientToolCalls
-        );
+        for client_item in [
+            json!({
+                "type":"custom_tool_call",
+                "call_id":"call_patch",
+                "name":"apply_patch",
+                "input":"*** Begin Patch"
+            }),
+            json!({
+                "type":"shell_call",
+                "call_id":"call_shell",
+                "action":{"type":"exec","command":"pwd"}
+            }),
+            json!({
+                "type":"computer_call",
+                "call_id":"call_computer",
+                "action":{"type":"screenshot"}
+            }),
+        ] {
+            let response = json!({
+                "output": [
+                    {
+                        "type":"function_call",
+                        "call_id":"call_search",
+                        "name":"web_search",
+                        "arguments":"{}"
+                    },
+                    client_item
+                ]
+            });
+
+            assert_eq!(
+                scan_responses_hosted_tool_calls(&response, &config),
+                ResponsesHostedToolCallScan::MixedHostedAndClientToolCalls
+            );
+        }
     }
 
     #[test]
